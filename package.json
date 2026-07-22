@@ -7,8 +7,9 @@
   "license": "UNLICENSED",
   "scripts": {
     "clean": "node -e \"fs.rmSync('dist', { recursive: true, force: true })\"",
-    "prebuild": "npm run clean",
-    "build": "node node_modules/typescript-7/bin/tsc -p tsconfig.build.json",
+    "postinstall": "prisma generate",
+    "prebuild": "pnpm clean",
+    "build": "prisma generate && node node_modules/typescript-7/bin/tsc -p tsconfig.build.json",
     "typecheck": "node node_modules/typescript-7/bin/tsc --noEmit",
     "start": "nest start",
     "start:dev": "nest start --watch",
