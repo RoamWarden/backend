@@ -1,0 +1,352 @@
+// RoamWarden data model — see RoamWarden-Build-Plan.pdf §9.
+//
+// Geospatial columns use PostGIS geography(SRID 4326) via Prisma `Unsupported`
+// types. They are nullable so the generated client stays fully usable; services
+// populate them with raw SQL in the same transaction as the row write, and all
+// geo queries (corridor matching, radius search, bbox) go through
+// $queryRaw/$executeRaw. Every geography column gets a GiST index (added by
+// hand in the migration).
+//
+// Plain lat/lng float columns sit alongside each geography column so reads
+// never need PostGIS round-trips.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [postgis]
+}
+
+// ─────────────────────────────── enums ───────────────────────────────
+
+enum TransportMode {
+  CAR
+  BUS
+  MOTORBIKE
+  TRAIN
+  WALK
+  BICYCLE
+  OTHER
+
+  @@map("transport_mode")
+}
+
+enum TripStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+  SOS
+
+  @@map("trip_status")
+}
+
+enum ReportType {
+  ROBBERY
+  HOLD_UP
+  ACCIDENT
+  CHECKPOINT
+  UNREST
+  BAD_ROAD
+  LOST_ITEM
+  OTHER
+
+  @@map("report_type")
+}
+
+enum ReportStatus {
+  UNCONFIRMED
+  VERIFIED
+  REJECTED
+  EXPIRED
+  REMOVED
+
+  @@map("report_status")
+}
+
+enum AlertChannel {
+  WEBSOCKET
+  PUSH
+
+  @@map("alert_channel")
+}
+
+enum DevicePlatform {
+  IOS
+  ANDROID
+
+  @@map("device_platform")
+}
+
+// ─────────────────────────────── identity ───────────────────────────────
+
+model User {
+  id         String   @id @default(uuid()) @db.Uuid
+  // Nullable: Google-only accounts have a googleSub and no passwordHash;
+  // email/password accounts have a passwordHash and no googleSub. Either
+  // identity keys the same email-unique user row.
+  googleSub    String?  @unique @map("google_sub")
+  passwordHash String?  @map("password_hash")
+  isAdmin      Boolean  @default(false) @map("is_admin")
+  email        String   @unique
+  name         String
+  avatarUrl    String?  @map("avatar_url")
+  phone        String?
+  reputation   Int      @default(0)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  refreshTokens       RefreshToken[]
+  passwordResetTokens PasswordResetToken[]
+  trustedContacts     TrustedContact[]     @relation("owner")
+  linkedAsContact     TrustedContact[]     @relation("contactUser")
+  trips               Trip[]
+  reports             Report[]
+  reportVotes         ReportVote[]
+  alerts              Alert[]
+  deviceTokens        DeviceToken[]
+  sosEvents           SosEvent[]
+
+  @@map("users")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+// Early-access waitlist (landing-page signups). Not tied to a user account.
+model WaitlistEntry {
+  id        String   @id @default(uuid()) @db.Uuid
+  email     String   @unique
+  source    String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@map("waitlist_entries")
+}
+
+model RefreshToken {
+  id                String    @id @default(uuid()) @db.Uuid
+  userId            String    @map("user_id") @db.Uuid
+  tokenHash         String    @unique @map("token_hash")
+  expiresAt         DateTime  @map("expires_at")
+  revokedAt         DateTime? @map("revoked_at")
+  replacedByTokenId String?   @map("replaced_by_token_id") @db.Uuid
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model TrustedContact {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String   @map("user_id") @db.Uuid
+  contactUserId String?  @map("contact_user_id") @db.Uuid
+  name          String
+  phone         String?
+  email         String?
+  relation      String?
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  user        User          @relation("owner", fields: [userId], references: [id], onDelete: Cascade)
+  contactUser User?         @relation("contactUser", fields: [contactUserId], references: [id], onDelete: SetNull)
+  watching    TripWatcher[]
+
+  @@unique([userId, contactUserId])
+  @@index([userId])
+  @@map("trusted_contacts")
+}
+
+model DeviceToken {
+  id         String         @id @default(uuid()) @db.Uuid
+  userId     String         @map("user_id") @db.Uuid
+  token      String         @unique
+  platform   DevicePlatform
+  createdAt  DateTime       @default(now()) @map("created_at")
+  lastSeenAt DateTime       @default(now()) @map("last_seen_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("device_tokens")
+}
+
+// ─────────────────────────────── trips ───────────────────────────────
+
+model Trip {
+  id                String     @id @default(uuid()) @db.Uuid
+  userId            String     @map("user_id") @db.Uuid
+  mode              TransportMode
+  status            TripStatus @default(ACTIVE)
+  originLabel       String?    @map("origin_label")
+  destLabel         String?    @map("dest_label")
+  originLat         Float      @map("origin_lat")
+  originLng         Float      @map("origin_lng")
+  destLat           Float      @map("dest_lat")
+  destLng           Float      @map("dest_lng")
+  origin            Unsupported("geography(Point, 4326)")?
+  destination       Unsupported("geography(Point, 4326)")?
+  startedAt         DateTime   @default(now()) @map("started_at")
+  endedAt           DateTime?  @map("ended_at")
+  durationS         Int?       @map("duration_s")
+  expectedDurationS Int?       @map("expected_duration_s")
+  // Bumped whenever a fresh share token is issued; embedded in the token and
+  // checked on the live view, so reissuing revokes every prior share link.
+  shareTokenVersion Int        @default(0) @map("share_token_version")
+  // No-arrival / stall escalation state (build plan §13#4). lastPointAt tracks
+  // the freshest breadcrumb; checkinAt records an "I'm OK" response;
+  // overdueNotifiedAt/escalatedAt gate the escalation ladder so it fires once.
+  lastPointAt       DateTime?  @map("last_point_at")
+  checkinAt         DateTime?  @map("checkin_at")
+  overdueNotifiedAt DateTime?  @map("overdue_notified_at")
+  escalatedAt       DateTime?  @map("escalated_at")
+  createdAt         DateTime   @default(now()) @map("created_at")
+  updatedAt         DateTime   @updatedAt @map("updated_at")
+
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  points   TripPoint[]
+  route    TripRoute?
+  watchers TripWatcher[]
+  alerts   Alert[]
+  sosEvents SosEvent[]
+
+  @@index([userId, status])
+  @@index([status])
+  @@map("trips")
+}
+
+model TripPoint {
+  id         BigInt   @id @default(autoincrement())
+  tripId     String   @map("trip_id") @db.Uuid
+  lat        Float
+  lng        Float
+  speed      Float?
+  heading    Float?
+  accuracy   Float?
+  recordedAt DateTime @map("recorded_at")
+  geog       Unsupported("geography(Point, 4326)")?
+
+  trip Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+
+  @@index([tripId, recordedAt])
+  @@map("trip_points")
+}
+
+model TripRoute {
+  tripId    String   @id @map("trip_id") @db.Uuid
+  path      Unsupported("geography(LineString, 4326)")?
+  source    String? // 'directions' | 'straight_line'
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  trip Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
+
+  @@map("trip_routes")
+}
+
+model TripWatcher {
+  id         String    @id @default(uuid()) @db.Uuid
+  tripId     String    @map("trip_id") @db.Uuid
+  contactId  String    @map("contact_id") @db.Uuid
+  notifiedAt DateTime? @map("notified_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  trip    Trip           @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  contact TrustedContact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([tripId, contactId])
+  @@map("trip_watchers")
+}
+
+// ─────────────────────────────── community reports ───────────────────────────────
+
+model Report {
+  id           String       @id @default(uuid()) @db.Uuid
+  reporterId   String       @map("reporter_id") @db.Uuid
+  type         ReportType
+  status       ReportStatus @default(UNCONFIRMED)
+  lat          Float
+  lng          Float
+  geog         Unsupported("geography(Point, 4326)")?
+  note         String?
+  confirmCount Int          @default(0) @map("confirm_count")
+  denyCount    Int          @default(0) @map("deny_count")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  expiresAt    DateTime     @map("expires_at")
+  // Moderation audit (build plan §16/§17). Set when an admin removes a report;
+  // removedById is a plain admin user id (no FK back-relation on purpose).
+  removedById     String?   @map("removed_by_id") @db.Uuid
+  removedReason   String?   @map("removed_reason")
+  removedAt       DateTime? @map("removed_at")
+
+  reporter User         @relation(fields: [reporterId], references: [id], onDelete: Cascade)
+  votes    ReportVote[]
+  alerts   Alert[]
+
+  @@index([status, expiresAt])
+  @@index([reporterId])
+  @@map("reports")
+}
+
+model ReportVote {
+  reportId  String   @map("report_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  vote      Int // +1 confirm, -1 deny
+  createdAt DateTime @default(now()) @map("created_at")
+
+  report Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([reportId, userId])
+  @@map("report_votes")
+}
+
+model Alert {
+  id          String       @id @default(uuid()) @db.Uuid
+  reportId    String       @map("report_id") @db.Uuid
+  userId      String       @map("user_id") @db.Uuid
+  tripId      String?      @map("trip_id") @db.Uuid
+  channel     AlertChannel
+  deliveredAt DateTime     @default(now()) @map("delivered_at")
+
+  report Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trip   Trip?  @relation(fields: [tripId], references: [id], onDelete: SetNull)
+
+  @@unique([reportId, userId, channel])
+  @@index([userId])
+  @@map("alerts")
+}
+
+// ─────────────────────────────── SOS ───────────────────────────────
+
+model SosEvent {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  tripId     String?   @map("trip_id") @db.Uuid
+  lat        Float?
+  lng        Float?
+  message    String?
+  createdAt  DateTime  @default(now()) @map("created_at")
+  resolvedAt DateTime? @map("resolved_at")
+
+  user User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trip Trip? @relation(fields: [tripId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@map("sos_events")
+}
