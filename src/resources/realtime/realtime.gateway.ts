@@ -98,11 +98,31 @@ export class RealtimeGateway
     sub.on('pmessage', (_pattern: string, channel: string, raw: string) => {
       this.handleTripLiveMessage(channel, raw);
     });
-    await sub.subscribe(CHANNEL_ALERT_INCIDENT, CHANNEL_SOS);
-    await sub.psubscribe(PATTERN_TRIP_LIVE);
-    this.logger.log(
-      `Realtime bridge subscribed to ${CHANNEL_ALERT_INCIDENT}, ${CHANNEL_SOS} and ${PATTERN_TRIP_LIVE}`,
-    );
+    // (Re)subscribe whenever the connection becomes ready — including after a
+    // boot-time Redis outage — so the bridge self-heals without a restart.
+    sub.on('ready', () => {
+      void this.subscribeAll(sub);
+    });
+    // Best-effort initial subscribe: NEVER crash boot if Redis is unreachable
+    // (a failed command would otherwise reject and abort app startup, so the
+    // HTTP port would never bind on hosts like Render).
+    await this.subscribeAll(sub);
+  }
+
+  private async subscribeAll(sub: Redis): Promise<void> {
+    try {
+      await sub.subscribe(CHANNEL_ALERT_INCIDENT, CHANNEL_SOS);
+      await sub.psubscribe(PATTERN_TRIP_LIVE);
+      this.logger.log(
+        `Realtime bridge subscribed to ${CHANNEL_ALERT_INCIDENT}, ${CHANNEL_SOS} and ${PATTERN_TRIP_LIVE}`,
+      );
+    } catch (err) {
+      this.logger.error(
+        `Realtime bridge could not subscribe to Redis (will retry on reconnect): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 
   async onModuleDestroy(): Promise<void> {

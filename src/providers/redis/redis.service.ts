@@ -23,23 +23,47 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   readonly client: Redis;
   readonly publisher: Redis;
   private readonly ownedSubscribers: Redis[] = [];
+  private lastErrorLogAt = 0;
 
   constructor(config: ConfigService) {
     const url = config.getOrThrow<string>('REDIS_URL');
-    this.client = new Redis(url, {
-      lazyConnect: true,
-      maxRetriesPerRequest: 3,
-    });
-    this.publisher = new Redis(url, {
-      lazyConnect: true,
-      maxRetriesPerRequest: 3,
+    const options = { lazyConnect: true, maxRetriesPerRequest: 3 } as const;
+    this.client = new Redis(url, options);
+    this.publisher = new Redis(url, options);
+    // CRITICAL: ioredis emits an 'error' event on every failed connection
+    // attempt. With NO 'error' listener, Node promotes it to an *unhandled error
+    // event* and ABORTS the process (SIGABRT / exit 134) — killing the app
+    // before it can bind its port. Attaching a listener keeps us alive so
+    // ioredis can reconnect in the background.
+    this.attachErrorLogger(this.client, 'client');
+    this.attachErrorLogger(this.publisher, 'publisher');
+  }
+
+  private attachErrorLogger(conn: Redis, which: string): void {
+    conn.on('error', (err: Error) => {
+      // Throttle reconnect-storm spam to one line per 30s.
+      const now = Date.now();
+      if (now - this.lastErrorLogAt > 30_000) {
+        this.lastErrorLogAt = now;
+        this.logger.warn(`Redis ${which} connection error: ${err.message}`);
+      }
     });
   }
 
   async onModuleInit(): Promise<void> {
-    await this.client.connect();
-    await this.publisher.connect();
-    this.logger.log('Connected to Redis');
+    // Connect eagerly but NEVER block or crash boot on it: the HTTP port must
+    // bind even if Redis is briefly unreachable at startup. ioredis auto-
+    // reconnects, and /health reports the live status.
+    try {
+      await Promise.all([this.client.connect(), this.publisher.connect()]);
+      this.logger.log('Connected to Redis');
+    } catch (err) {
+      this.logger.error(
+        `Redis not reachable at boot — starting anyway; it will reconnect in the background. ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -53,6 +77,8 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   /** New dedicated connection for subscribing. Auto-closed on shutdown. */
   createSubscriber(): Redis {
     const sub = this.client.duplicate();
+    // Same crash-guard as the main connections.
+    this.attachErrorLogger(sub, 'subscriber');
     this.ownedSubscribers.push(sub);
     return sub;
   }
