@@ -238,7 +238,7 @@ describe('UsersService', () => {
 
       const result = await service.upsertFromGoogle({
         sub: 'sub-123',
-        email: 'a@b.com',
+        email: 'A@B.com', // mixed case — must be stored lowercased
         name: 'Ada',
         avatarUrl: 'http://img/a.png',
       });

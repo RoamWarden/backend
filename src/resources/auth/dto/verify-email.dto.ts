@@ -1,8 +1,10 @@
 import { IsEmail, IsString, Matches } from 'class-validator';
 import { EMAIL_OTP_LENGTH } from '../../../common/constants';
+import { NormalizeEmail } from '../../../common/transforms/normalize-email';
 
 export class VerifyEmailDto {
   @IsEmail({}, { message: 'email must be a valid email address.' })
+  @NormalizeEmail()
   email!: string;
 
   @IsString({ message: 'code must be a string.' })

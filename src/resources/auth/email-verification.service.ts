@@ -10,11 +10,15 @@ import { createHmac, randomInt } from 'node:crypto';
 import {
   EMAIL_OTP_LENGTH,
   EMAIL_OTP_MAX_ATTEMPTS,
+  EMAIL_OTP_MAX_SENDS_PER_WINDOW,
   EMAIL_OTP_RESEND_COOLDOWN_S,
+  EMAIL_OTP_SEND_WINDOW_S,
   EMAIL_OTP_TTL_S,
 } from '../../common/constants';
 import { PrismaService } from '../../prisma/prisma.service';
 import { MailService } from '../../providers/mail/mail.service';
+import { RedisService } from '../../providers/redis/redis.service';
+import { normalizeEmail } from '../../common/transforms/normalize-email';
 import { UsersService } from '../user/users.service';
 import { TokensService } from './tokens.service';
 import type { ResendVerificationDto } from './dto/resend-verification.dto';
@@ -48,6 +52,7 @@ export class EmailVerificationService {
     private readonly usersService: UsersService,
     private readonly tokensService: TokensService,
     private readonly mailService: MailService,
+    private readonly redis: RedisService,
     config: ConfigService,
   ) {
     // Reuse the refresh-token secret to key the OTP HMAC — no new env var to
@@ -80,6 +85,13 @@ export class EmailVerificationService {
       ) {
         return; // within cooldown — do not send another code
       }
+    }
+
+    // Per-email hourly send quota (cross-IP anti email-bomb — per-IP throttling
+    // can't stop a distributed sender targeting one address). Fail-open if Redis
+    // is down; the DB cooldown above still limits rapid sends.
+    if (!(await this.withinSendQuota(user.email))) {
+      return;
     }
 
     // One live code at a time: retire any outstanding ones for this user.
@@ -199,6 +211,20 @@ export class EmailVerificationService {
       }
     }
     return { message: this.resendMessage };
+  }
+
+  /**
+   * Per-email send quota check (increments the window counter). Fail-open: a
+   * null count means Redis is unavailable, so we allow the send rather than
+   * block legitimate sign-ups (the DB cooldown still bounds abuse).
+   */
+  private async withinSendQuota(email: string): Promise<boolean> {
+    const key = `otp:send-quota:${normalizeEmail(email)}`;
+    const count = await this.redis.incrementCounter(
+      key,
+      EMAIL_OTP_SEND_WINDOW_S,
+    );
+    return count === null || count <= EMAIL_OTP_MAX_SENDS_PER_WINDOW;
   }
 
   /** Cryptographically-random zero-padded code, e.g. "004217". */

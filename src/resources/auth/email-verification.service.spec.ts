@@ -4,10 +4,14 @@ import {
 } from '@nestjs/common';
 import type { User } from '@prisma/client';
 import { createHmac } from 'node:crypto';
-import { EMAIL_OTP_MAX_ATTEMPTS } from '../../common/constants';
+import {
+  EMAIL_OTP_MAX_ATTEMPTS,
+  EMAIL_OTP_MAX_SENDS_PER_WINDOW,
+} from '../../common/constants';
 import { EmailVerificationService } from './email-verification.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { MailService } from '../../providers/mail/mail.service';
+import { RedisService } from '../../providers/redis/redis.service';
 import { UsersService } from '../user/users.service';
 import { TokensService } from './tokens.service';
 import type { ConfigService } from '@nestjs/config';
@@ -85,6 +89,7 @@ describe('EmailVerificationService', () => {
   let usersService: { findByEmail: jest.Mock; markEmailVerified: jest.Mock };
   let tokensService: { issueSession: jest.Mock };
   let mailService: { sendVerificationCode: jest.Mock; sendWelcome: jest.Mock };
+  let redis: { incrementCounter: jest.Mock };
   let service: EmailVerificationService;
 
   beforeEach(() => {
@@ -98,6 +103,8 @@ describe('EmailVerificationService', () => {
       sendVerificationCode: jest.fn().mockResolvedValue(undefined),
       sendWelcome: jest.fn().mockResolvedValue(undefined),
     };
+    // Default: within the per-email send quota (count 1 <= max).
+    redis = { incrementCounter: jest.fn().mockResolvedValue(1) };
     const config = {
       getOrThrow: jest.fn().mockReturnValue(OTP_SECRET),
     } as unknown as ConfigService;
@@ -107,6 +114,7 @@ describe('EmailVerificationService', () => {
       usersService as unknown as UsersService,
       tokensService as unknown as TokensService,
       mailService as unknown as MailService,
+      redis as unknown as RedisService,
       config,
     );
   });
@@ -172,6 +180,25 @@ describe('EmailVerificationService', () => {
       await expect(service.start(makeUser(), { force: true })).rejects.toThrow(
         ServiceUnavailableException,
       );
+    });
+
+    it('skips the send when the per-email quota is exceeded (anti email-bomb)', async () => {
+      redis.incrementCounter.mockResolvedValue(
+        EMAIL_OTP_MAX_SENDS_PER_WINDOW + 1,
+      );
+
+      await service.start(makeUser(), { force: true });
+
+      expect(prisma.emailVerificationOtp.create).not.toHaveBeenCalled();
+      expect(mailService.sendVerificationCode).not.toHaveBeenCalled();
+    });
+
+    it('sends anyway (fail-open) when Redis is unavailable for the quota check', async () => {
+      redis.incrementCounter.mockResolvedValue(null);
+
+      await service.start(makeUser(), { force: true });
+
+      expect(mailService.sendVerificationCode).toHaveBeenCalledTimes(1);
     });
   });
 

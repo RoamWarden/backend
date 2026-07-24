@@ -9,6 +9,7 @@ import { Prisma } from '@prisma/client';
 import type { DeviceToken, TrustedContact, User } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../providers/redis/redis.service';
+import { normalizeEmail } from '../../common/transforms/normalize-email';
 import type { CreateContactDto } from './dto/create-contact.dto';
 import type { RegisterDeviceDto } from './dto/register-device.dto';
 import type { UpdateContactDto } from './dto/update-contact.dto';
@@ -50,19 +51,20 @@ export class UsersService {
     name: string;
     avatarUrl?: string;
   }): Promise<User> {
+    const email = normalizeEmail(p.email);
     try {
       return await this.prisma.user.upsert({
         where: { googleSub: p.sub },
         create: {
           googleSub: p.sub,
-          email: p.email,
+          email,
           name: p.name,
           avatarUrl: p.avatarUrl ?? null,
           // Google asserts the email is verified, so these accounts skip OTP.
           emailVerifiedAt: new Date(),
         },
         update: {
-          email: p.email,
+          email,
           name: p.name,
           // undefined = Google sent no picture — keep whatever we have.
           avatarUrl: p.avatarUrl,
@@ -72,7 +74,7 @@ export class UsersService {
       if (this.isPrismaError(error, 'P2002')) {
         // The unique email already belongs to a row with a different googleSub.
         throw new ConflictException(
-          `The email ${p.email} is already registered to a different RoamWarden account. Sign in with the Google account you originally used, or contact support.`,
+          `The email ${email} is already registered to a different RoamWarden account. Sign in with the Google account you originally used, or contact support.`,
         );
       }
       this.logger.error(

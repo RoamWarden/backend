@@ -94,6 +94,14 @@ export const EMAIL_OTP_MAX_ATTEMPTS = 5;
  */
 export const EMAIL_OTP_RESEND_COOLDOWN_S = 60;
 
+/**
+ * Per-email verification-code send quota. Unlike per-IP throttling, this caps
+ * how many codes any single address can receive per window regardless of how
+ * many IPs a sender uses — the real defence against email-bombing one victim.
+ */
+export const EMAIL_OTP_MAX_SENDS_PER_WINDOW = 5;
+export const EMAIL_OTP_SEND_WINDOW_S = 60 * 60;
+
 /** Default TTLs when env vars are absent. */
 export const DEFAULT_JWT_ACCESS_TTL = '15m';
 export const DEFAULT_JWT_REFRESH_TTL = '30d';
