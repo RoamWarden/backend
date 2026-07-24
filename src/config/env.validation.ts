@@ -108,10 +108,15 @@ export class EnvironmentVariables {
   SENTRY_DSN?: string;
 
   // Email (optional — emails degrade to logged output when no provider is set).
-  // Resend is the primary provider; SMTP_URL is a legacy fallback.
+  // Brevo is the primary provider; SMTP_URL is a legacy fallback.
   @IsOptional()
   @IsString()
-  RESEND_API_KEY?: string;
+  BREVO_API_KEY?: string;
+
+  // Override the Brevo API base URL (defaults to https://api.brevo.com).
+  @IsOptional()
+  @IsString()
+  BREVO_API_BASE_URL?: string;
 
   @IsOptional()
   @IsString()

@@ -11,8 +11,11 @@ export const EMAIL_VERIFICATION_SUBJECT = 'Your RoamWarden verification code';
 export const WAITLIST_CONFIRMATION_SUBJECT = "You're on the RoamWarden list";
 
 /**
- * Default sender. Uses Resend's shared testing domain so a bare RESEND_API_KEY
- * works out of the box. In production, verify your own domain in Resend and set
- * MAIL_FROM (e.g. 'RoamWarden <hello@roamwarden.app>').
+ * Default sender. MUST be a sender/domain you have VERIFIED in Brevo — Brevo
+ * rejects transactional sends from unverified senders. Override with MAIL_FROM
+ * (e.g. 'RoamWarden <no-reply@roamwarden.app>').
  */
-export const DEFAULT_MAIL_FROM = 'RoamWarden <onboarding@resend.dev>';
+export const DEFAULT_MAIL_FROM = 'RoamWarden <no-reply@roamwarden.app>';
+
+/** Brevo transactional API base URL (override with BREVO_API_BASE_URL). */
+export const DEFAULT_BREVO_API_BASE_URL = 'https://api.brevo.com';

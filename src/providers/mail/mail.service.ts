@@ -2,48 +2,66 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as nodemailer from 'nodemailer';
 import type { Transporter } from 'nodemailer';
-import { Resend } from 'resend';
 import { EMAIL_OTP_TTL_S } from '../../common/constants';
-import { DEFAULT_MAIL_FROM } from './constant/mail.constants';
+import {
+  DEFAULT_BREVO_API_BASE_URL,
+  DEFAULT_MAIL_FROM,
+} from './constant/mail.constants';
 import type { ComposedEmail } from './templates/password-reset.template';
 import { emailVerificationEmail } from './templates/email-verification.template';
 import { passwordResetEmail } from './templates/password-reset.template';
 import { welcomeEmail } from './templates/welcome.template';
 import { waitlistConfirmationEmail } from './templates/waitlist.template';
 
-type MailMode = 'resend' | 'smtp' | 'log-only';
+type MailMode = 'brevo' | 'smtp' | 'log-only';
+
+/** Sender identity — Brevo needs a name + a verified email, split out of MAIL_FROM. */
+interface MailSender {
+  name: string;
+  email: string;
+}
 
 /**
- * Outbound email. Prefers Resend (RESEND_API_KEY); falls back to a legacy SMTP
- * transport (SMTP_URL); if neither is configured, runs in log-only mode so
- * links are logged, never lost. No send method ever throws — email delivery
- * must not break the request that triggered it (build plan §10, "never fail
- * silently").
+ * Outbound email. Prefers Brevo's transactional API (BREVO_API_KEY); falls back
+ * to a legacy SMTP transport (SMTP_URL); if neither is configured, runs in
+ * log-only mode so links/codes are logged, never lost. No send method throws —
+ * email delivery must not break the request that triggered it (build plan §10,
+ * "never fail silently") — EXCEPT a `critical` send (a verification code the
+ * user is waiting on), which re-throws so the caller can surface it.
  */
 @Injectable()
 export class MailService implements OnModuleInit {
   private readonly logger = new Logger(MailService.name);
   private mode: MailMode = 'log-only';
-  private resend: Resend | null = null;
   private transporter: Transporter | null = null;
-  // Default to Resend's shared testing sender so a bare API key works out of
-  // the box. Production should verify a domain in Resend and set MAIL_FROM.
-  private from = DEFAULT_MAIL_FROM;
+  private brevoApiKey = '';
+  private brevoSendEndpoint = '';
+  private brevoAccountEndpoint = '';
+  // Sender used by every provider. Defaults to a placeholder — set MAIL_FROM to
+  // a sender/domain you've VERIFIED in Brevo or sends will be rejected.
+  private sender: MailSender = parseMailFrom(DEFAULT_MAIL_FROM);
 
   constructor(private readonly config: ConfigService) {}
 
   onModuleInit(): void {
-    const resendKey = this.config.get<string>('RESEND_API_KEY');
+    const brevoKey = this.config.get<string>('BREVO_API_KEY');
     const smtpUrl = this.config.get<string>('SMTP_URL');
     const from = this.config.get<string>('MAIL_FROM');
     if (from && from.length > 0) {
-      this.from = from;
+      this.sender = parseMailFrom(from);
     }
 
-    if (resendKey && resendKey.length > 0) {
-      this.resend = new Resend(resendKey);
-      this.mode = 'resend';
-      this.logger.log('Email enabled — Resend');
+    if (brevoKey && brevoKey.length > 0) {
+      this.brevoApiKey = brevoKey;
+      const base = (
+        this.config.get<string>('BREVO_API_BASE_URL') ??
+        DEFAULT_BREVO_API_BASE_URL
+      ).replace(/\/+$/, '');
+      this.brevoSendEndpoint = `${base}/v3/smtp/email`;
+      this.brevoAccountEndpoint = `${base}/v3/account`;
+      this.mode = 'brevo';
+      this.logger.log(`Email enabled — Brevo API (from ${this.sender.email})`);
+      void this.verifyBrevoConnection();
     } else if (smtpUrl && smtpUrl.length > 0) {
       this.transporter = nodemailer.createTransport(smtpUrl);
       this.mode = 'smtp';
@@ -51,7 +69,7 @@ export class MailService implements OnModuleInit {
     } else {
       this.mode = 'log-only';
       this.logger.warn(
-        'Email disabled — set RESEND_API_KEY; emails will be logged, not sent.',
+        'Email disabled — set BREVO_API_KEY; emails will be logged, not sent.',
       );
     }
   }
@@ -112,7 +130,8 @@ export class MailService implements OnModuleInit {
   /**
    * Dispatches a composed email via whichever provider is active. In log-only
    * mode it logs a concise line (including the key link/summary). All transport
-   * calls are wrapped in try/catch so a failure is logged and never thrown.
+   * calls are wrapped in try/catch so a failure is logged and never thrown —
+   * unless `critical`, in which case it re-throws so the caller can surface it.
    */
   private async dispatch(
     to: string,
@@ -126,17 +145,11 @@ export class MailService implements OnModuleInit {
     }
 
     try {
-      if (this.mode === 'resend' && this.resend) {
-        await this.resend.emails.send({
-          from: this.from,
-          to,
-          subject: email.subject,
-          html: email.html,
-          text: email.text,
-        });
+      if (this.mode === 'brevo') {
+        await this.sendViaBrevo(to, email);
       } else if (this.mode === 'smtp' && this.transporter) {
         await this.transporter.sendMail({
-          from: this.from,
+          from: `${this.sender.name} <${this.sender.email}>`,
           to,
           subject: email.subject,
           html: email.html,
@@ -155,5 +168,97 @@ export class MailService implements OnModuleInit {
         throw err;
       }
     }
+  }
+
+  /** Sends one transactional email through Brevo's REST API (POST /v3/smtp/email). */
+  private async sendViaBrevo(to: string, email: ComposedEmail): Promise<void> {
+    const payload = {
+      sender: { name: this.sender.name, email: this.sender.email },
+      to: [{ email: to }],
+      subject: email.subject,
+      htmlContent: email.html,
+      textContent: email.text,
+    };
+
+    const response = await withRequestTimeout(
+      (signal) =>
+        fetch(this.brevoSendEndpoint, {
+          method: 'POST',
+          headers: {
+            accept: 'application/json',
+            'content-type': 'application/json',
+            'api-key': this.brevoApiKey,
+          },
+          body: JSON.stringify(payload),
+          signal,
+        }),
+      15000,
+    );
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(
+        `Brevo API returned ${response.status} ${response.statusText}: ${body}`,
+      );
+    }
+  }
+
+  /** Best-effort startup check that the Brevo API key works. Only logs. */
+  private async verifyBrevoConnection(): Promise<void> {
+    try {
+      const response = await withRequestTimeout(
+        (signal) =>
+          fetch(this.brevoAccountEndpoint, {
+            method: 'GET',
+            headers: {
+              accept: 'application/json',
+              'api-key': this.brevoApiKey,
+            },
+            signal,
+          }),
+        10000,
+      );
+      if (!response.ok) {
+        this.logger.error(
+          `Brevo API verification failed (${response.status} ${response.statusText})`,
+        );
+        return;
+      }
+      this.logger.log('Brevo API verification successful');
+    } catch (err) {
+      this.logger.error(
+        `Brevo API verification failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+}
+
+/** Splits `"RoamWarden <hello@x.com>"` (or a bare email) into a Brevo sender. */
+function parseMailFrom(value: string): MailSender {
+  const match = /^\s*(.*?)\s*<\s*([^>]+)\s*>\s*$/.exec(value);
+  if (match && match[2]) {
+    return { name: match[1]?.trim() || 'RoamWarden', email: match[2].trim() };
+  }
+  return { name: 'RoamWarden', email: value.trim() };
+}
+
+/** Runs `run` with an abort signal that fires after `timeoutMs`. */
+async function withRequestTimeout<T>(
+  run: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  const controller = new AbortController();
+  const handle = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await run(controller.signal);
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error(`Brevo request timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(handle);
   }
 }
