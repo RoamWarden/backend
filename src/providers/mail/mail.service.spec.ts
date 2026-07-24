@@ -14,96 +14,117 @@ const sendMailMock = jest.fn();
 jest.mock('nodemailer', () => ({
   createTransport: jest.fn(() => ({ sendMail: sendMailMock })),
 }));
-
-// Mock resend so no real Resend client is ever created.
-const resendSendMock = jest.fn();
-jest.mock('resend', () => ({
-  Resend: jest.fn(() => ({ emails: { send: resendSendMock } })),
-}));
-
 const createTransportMock = nodemailer.createTransport as unknown as jest.Mock;
-const ResendMock = jest.requireMock<{ Resend: jest.Mock }>('resend').Resend;
 
-const RESEND_API_KEY = 're_test_key';
+// Mock the global fetch used by the Brevo transport.
+const fetchMock = jest.fn();
+const realFetch = global.fetch;
+beforeAll(() => {
+  global.fetch = fetchMock;
+});
+afterAll(() => {
+  global.fetch = realFetch;
+});
+
+const BREVO_API_KEY = 'xkeysib-test-key';
 const SMTP_URL = 'smtp://user:pass@smtp.example.com:587';
 const MAIL_FROM = 'RoamWarden Support <support@roamwarden.app>';
 
-/** Builds a MailService whose ConfigService returns the given env map. */
+interface FetchInit {
+  method: string;
+  headers: Record<string, string>;
+  body?: string;
+}
+
+interface BrevoPayload {
+  sender: { name: string; email: string };
+  to: Array<{ email: string }>;
+  subject: string;
+  htmlContent: string;
+  textContent: string;
+}
+
+/** A minimal Response stand-in for the fetch mock. */
+function fakeResponse(status: number, body = ''): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: status >= 200 && status < 300 ? 'OK' : 'Error',
+    text: () => Promise.resolve(body),
+  } as unknown as Response;
+}
+
 async function buildService(
   env: Record<string, string | number | undefined>,
 ): Promise<MailService> {
-  const configMock = {
-    get: jest.fn((key: string) => env[key]),
-  };
+  const configMock = { get: jest.fn((key: string) => env[key]) };
   const moduleRef: TestingModule = await Test.createTestingModule({
     providers: [MailService, { provide: ConfigService, useValue: configMock }],
   }).compile();
   return moduleRef.get(MailService);
 }
 
-type SendArg = {
-  from: string;
-  to: string;
-  subject: string;
-  text: string;
-  html: string;
-};
+function spyLogger(service: MailService, method: 'log' | 'warn' | 'error') {
+  return jest
+    .spyOn(
+      (service as unknown as { logger: Record<string, jest.Mock> }).logger,
+      method,
+    )
+    .mockImplementation(() => undefined);
+}
+
+/** The POST to Brevo's send endpoint (skips the startup /v3/account verify GET). */
+function brevoSendCall(): { url: string; init: FetchInit } | undefined {
+  const call = (fetchMock.mock.calls as Array<[string, FetchInit]>).find(
+    ([url, init]) => url.includes('/v3/smtp/email') && init.method === 'POST',
+  );
+  return call ? { url: call[0], init: call[1] } : undefined;
+}
+
+function sentPayload(): BrevoPayload {
+  const call = brevoSendCall();
+  if (!call?.init.body) throw new Error('no Brevo send call captured');
+  return JSON.parse(call.init.body) as BrevoPayload;
+}
 
 describe('MailService', () => {
   beforeEach(() => {
     createTransportMock.mockClear();
     sendMailMock.mockReset();
-    resendSendMock.mockReset();
-    ResendMock.mockClear();
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValue(fakeResponse(201, '{"messageId":"<id>"}'));
   });
 
   describe('when nothing is configured (log-only)', () => {
     it('onModuleInit logs one disabled warning and creates no provider', async () => {
       const service = await buildService({});
-      const warnSpy = jest
-        .spyOn(
-          (service as unknown as { logger: { warn: jest.Mock } }).logger,
-          'warn',
-        )
-        .mockImplementation(() => undefined);
+      const warnSpy = spyLogger(service, 'warn');
 
       service.onModuleInit();
 
-      expect(warnSpy).toHaveBeenCalledTimes(1);
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining('Email disabled'),
       );
       expect(createTransportMock).not.toHaveBeenCalled();
-      expect(ResendMock).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
     });
 
     it('treats empty-string keys as unconfigured', async () => {
-      const service = await buildService({ RESEND_API_KEY: '', SMTP_URL: '' });
-      const warnSpy = jest
-        .spyOn(
-          (service as unknown as { logger: { warn: jest.Mock } }).logger,
-          'warn',
-        )
-        .mockImplementation(() => undefined);
+      const service = await buildService({ BREVO_API_KEY: '', SMTP_URL: '' });
+      const warnSpy = spyLogger(service, 'warn');
 
       service.onModuleInit();
 
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining('Email disabled'),
       );
-      expect(createTransportMock).not.toHaveBeenCalled();
-      expect(ResendMock).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
     });
 
     it('sendPasswordReset logs the link, does not throw, and calls no provider', async () => {
       const service = await buildService({});
       service.onModuleInit();
-      const logSpy = jest
-        .spyOn(
-          (service as unknown as { logger: { log: jest.Mock } }).logger,
-          'log',
-        )
-        .mockImplementation(() => undefined);
+      const logSpy = spyLogger(service, 'log');
 
       const resetUrl = 'https://app.roamwarden.app/reset-password?token=abc';
       await expect(
@@ -111,11 +132,11 @@ describe('MailService', () => {
       ).resolves.toBeUndefined();
 
       expect(sendMailMock).not.toHaveBeenCalled();
-      expect(resendSendMock).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
       expect(logSpy).toHaveBeenCalledWith(expect.stringContaining(resetUrl));
     });
 
-    it('sendWelcome and sendWaitlistConfirmation are safe no-throw log-only', async () => {
+    it('welcome / waitlist / verification code are safe no-throw log-only', async () => {
       const service = await buildService({});
       service.onModuleInit();
 
@@ -125,148 +146,115 @@ describe('MailService', () => {
       await expect(
         service.sendWaitlistConfirmation('traveller@example.com'),
       ).resolves.toBeUndefined();
-
-      expect(sendMailMock).not.toHaveBeenCalled();
-      expect(resendSendMock).not.toHaveBeenCalled();
-    });
-
-    it('sendVerificationCode is a safe no-throw log-only (dev reads the code from logs)', async () => {
-      const service = await buildService({});
-      service.onModuleInit();
-
       await expect(
         service.sendVerificationCode('traveller@example.com', '123456'),
       ).resolves.toBeUndefined();
 
-      expect(sendMailMock).not.toHaveBeenCalled();
-      expect(resendSendMock).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
     });
   });
 
-  describe('when Resend is configured', () => {
-    it('onModuleInit constructs Resend and logs enabled', async () => {
-      const service = await buildService({ RESEND_API_KEY });
-      const logSpy = jest
-        .spyOn(
-          (service as unknown as { logger: { log: jest.Mock } }).logger,
-          'log',
-        )
-        .mockImplementation(() => undefined);
+  describe('when Brevo is configured', () => {
+    it('onModuleInit selects Brevo, logs enabled, and verifies the API key', async () => {
+      const service = await buildService({ BREVO_API_KEY });
+      const logSpy = spyLogger(service, 'log');
 
       service.onModuleInit();
+      await Promise.resolve(); // let the fire-and-forget verify settle
 
-      expect(ResendMock).toHaveBeenCalledTimes(1);
-      expect(ResendMock).toHaveBeenCalledWith(RESEND_API_KEY);
       expect(createTransportMock).not.toHaveBeenCalled();
-      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Resend'));
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('Brevo'));
+      const verifyCall = (
+        fetchMock.mock.calls as Array<[string, FetchInit]>
+      ).find(
+        ([url, init]) => url.includes('/v3/account') && init.method === 'GET',
+      );
+      expect(verifyCall).toBeDefined();
+      expect(verifyCall?.[1].headers['api-key']).toBe(BREVO_API_KEY);
     });
 
-    it('prefers Resend over SMTP when both are set', async () => {
-      const service = await buildService({ RESEND_API_KEY, SMTP_URL });
-      service.onModuleInit();
-
-      expect(ResendMock).toHaveBeenCalledTimes(1);
-      expect(createTransportMock).not.toHaveBeenCalled();
-    });
-
-    it('sends password reset via Resend with MAIL_FROM, subject and url', async () => {
-      resendSendMock.mockResolvedValue({ data: { id: 'e-1' }, error: null });
-      const service = await buildService({ RESEND_API_KEY, MAIL_FROM });
+    it('sends password reset via Brevo with sender, subject, and url', async () => {
+      const service = await buildService({ BREVO_API_KEY, MAIL_FROM });
       service.onModuleInit();
 
       const resetUrl =
         'https://app.roamwarden.app/reset-password?token=reset-token';
       await service.sendPasswordReset('traveller@example.com', resetUrl);
 
-      expect(resendSendMock).toHaveBeenCalledTimes(1);
-      const arg = (resendSendMock.mock.calls as Array<[SendArg]>)[0][0];
-      expect(arg.from).toBe(MAIL_FROM);
-      expect(arg.to).toBe('traveller@example.com');
-      expect(arg.subject).toBe(PASSWORD_RESET_SUBJECT);
-      expect(arg.text).toContain(resetUrl);
-      expect(arg.html).toContain(resetUrl);
+      const call = brevoSendCall();
+      expect(call).toBeDefined();
+      expect(call?.init.headers['api-key']).toBe(BREVO_API_KEY);
+      const payload = sentPayload();
+      expect(payload.sender).toEqual({
+        name: 'RoamWarden Support',
+        email: 'support@roamwarden.app',
+      });
+      expect(payload.to).toEqual([{ email: 'traveller@example.com' }]);
+      expect(payload.subject).toBe(PASSWORD_RESET_SUBJECT);
+      expect(payload.htmlContent).toContain(resetUrl);
+      expect(payload.textContent).toContain(resetUrl);
     });
 
-    it('sends welcome via Resend with the recipient name', async () => {
-      resendSendMock.mockResolvedValue({ data: { id: 'e-2' }, error: null });
-      const service = await buildService({ RESEND_API_KEY });
+    it('sends welcome via Brevo with the recipient name', async () => {
+      const service = await buildService({ BREVO_API_KEY });
       service.onModuleInit();
 
       await service.sendWelcome('traveller@example.com', 'Ada');
 
-      const arg = (resendSendMock.mock.calls as Array<[SendArg]>)[0][0];
-      expect(arg.subject).toBe(WELCOME_SUBJECT);
-      expect(arg.html).toContain('Ada');
-      expect(arg.text).toContain('Ada');
+      const payload = sentPayload();
+      expect(payload.subject).toBe(WELCOME_SUBJECT);
+      expect(payload.htmlContent).toContain('Ada');
+      expect(payload.textContent).toContain('Ada');
     });
 
-    it('sends waitlist confirmation via Resend', async () => {
-      resendSendMock.mockResolvedValue({ data: { id: 'e-3' }, error: null });
-      const service = await buildService({ RESEND_API_KEY });
+    it('sends the verification code via Brevo with the code and subject', async () => {
+      const service = await buildService({ BREVO_API_KEY });
+      service.onModuleInit();
+
+      await service.sendVerificationCode('traveller@example.com', '123456');
+
+      const payload = sentPayload();
+      expect(payload.subject).toBe(EMAIL_VERIFICATION_SUBJECT);
+      expect(payload.htmlContent).toContain('123456');
+    });
+
+    it('falls back to the default (no-reply) sender when MAIL_FROM is absent', async () => {
+      const service = await buildService({ BREVO_API_KEY });
       service.onModuleInit();
 
       await service.sendWaitlistConfirmation('traveller@example.com');
 
-      const arg = (resendSendMock.mock.calls as Array<[SendArg]>)[0][0];
-      expect(arg.subject).toBe(WAITLIST_CONFIRMATION_SUBJECT);
+      const payload = sentPayload();
+      expect(payload.subject).toBe(WAITLIST_CONFIRMATION_SUBJECT);
+      expect(payload.sender.email).toBe('no-reply@roamwarden.app');
     });
 
-    it('falls back to the default resend.dev sender when MAIL_FROM is absent', async () => {
-      resendSendMock.mockResolvedValue({ data: { id: 'e-4' }, error: null });
-      const service = await buildService({ RESEND_API_KEY });
+    it('swallows a Brevo failure for non-critical emails — never throws', async () => {
+      const service = await buildService({ BREVO_API_KEY });
       service.onModuleInit();
-
-      await service.sendWaitlistConfirmation('traveller@example.com');
-
-      const arg = (resendSendMock.mock.calls as Array<[SendArg]>)[0][0];
-      expect(arg.from).toContain('onboarding@resend.dev');
-    });
-
-    it('swallows a Resend rejection — never throws to the caller', async () => {
-      resendSendMock.mockRejectedValue(new Error('Resend network error'));
-      const service = await buildService({ RESEND_API_KEY });
-      service.onModuleInit();
-      const errorSpy = jest
-        .spyOn(
-          (service as unknown as { logger: { error: jest.Mock } }).logger,
-          'error',
-        )
-        .mockImplementation(() => undefined);
+      fetchMock.mockResolvedValue(
+        fakeResponse(400, '{"message":"bad request"}'),
+      );
+      const errorSpy = spyLogger(service, 'error');
 
       await expect(
         service.sendWelcome('traveller@example.com', 'Ada'),
       ).resolves.toBeUndefined();
 
-      expect(errorSpy).toHaveBeenCalledTimes(1);
-    });
-
-    it('sends the verification code via Resend with the code and subject', async () => {
-      resendSendMock.mockResolvedValue({ data: { id: 'e-5' }, error: null });
-      const service = await buildService({ RESEND_API_KEY });
-      service.onModuleInit();
-
-      await service.sendVerificationCode('traveller@example.com', '123456');
-
-      const arg = (resendSendMock.mock.calls as Array<[SendArg]>)[0][0];
-      expect(arg.subject).toBe(EMAIL_VERIFICATION_SUBJECT);
-      expect(arg.html).toContain('123456');
-      expect(arg.text).toContain('123456');
+      expect(errorSpy).toHaveBeenCalled();
     });
 
     it('RE-THROWS when the verification email fails (critical, unlike other emails)', async () => {
-      resendSendMock.mockRejectedValue(new Error('Resend network error'));
-      const service = await buildService({ RESEND_API_KEY });
+      const service = await buildService({ BREVO_API_KEY });
       service.onModuleInit();
-      jest
-        .spyOn(
-          (service as unknown as { logger: { error: jest.Mock } }).logger,
-          'error',
-        )
-        .mockImplementation(() => undefined);
+      fetchMock.mockResolvedValue(
+        fakeResponse(400, '{"message":"bad request"}'),
+      );
+      spyLogger(service, 'error');
 
       await expect(
         service.sendVerificationCode('traveller@example.com', '123456'),
-      ).rejects.toThrow('Resend network error');
+      ).rejects.toThrow(/Brevo API returned 400/);
     });
   });
 
@@ -275,12 +263,11 @@ describe('MailService', () => {
       const service = await buildService({ SMTP_URL });
       service.onModuleInit();
 
-      expect(createTransportMock).toHaveBeenCalledTimes(1);
       expect(createTransportMock).toHaveBeenCalledWith(SMTP_URL);
-      expect(ResendMock).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it('sends via nodemailer with MAIL_FROM and the reset url', async () => {
+    it('sends via nodemailer with the sender and the reset url', async () => {
       sendMailMock.mockResolvedValue({ messageId: 'msg-1' });
       const service = await buildService({ SMTP_URL, MAIL_FROM });
       service.onModuleInit();
@@ -290,24 +277,31 @@ describe('MailService', () => {
       await service.sendPasswordReset('traveller@example.com', resetUrl);
 
       expect(sendMailMock).toHaveBeenCalledTimes(1);
-      const arg = (sendMailMock.mock.calls as Array<[SendArg]>)[0][0];
-      expect(arg.from).toBe(MAIL_FROM);
+      const arg = (
+        sendMailMock.mock.calls as Array<
+          [
+            {
+              from: string;
+              to: string;
+              subject: string;
+              text: string;
+              html: string;
+            },
+          ]
+        >
+      )[0][0];
+      expect(arg.from).toContain('support@roamwarden.app');
       expect(arg.to).toBe('traveller@example.com');
       expect(arg.subject).toBe(PASSWORD_RESET_SUBJECT);
       expect(arg.text).toContain(resetUrl);
       expect(arg.html).toContain(resetUrl);
     });
 
-    it('swallows a sendMail rejection — never throws to the caller', async () => {
+    it('swallows a sendMail rejection — never throws (non-critical)', async () => {
       sendMailMock.mockRejectedValue(new Error('SMTP connection refused'));
       const service = await buildService({ SMTP_URL, MAIL_FROM });
       service.onModuleInit();
-      const errorSpy = jest
-        .spyOn(
-          (service as unknown as { logger: { error: jest.Mock } }).logger,
-          'error',
-        )
-        .mockImplementation(() => undefined);
+      const errorSpy = spyLogger(service, 'error');
 
       await expect(
         service.sendPasswordReset(
@@ -325,8 +319,7 @@ describe('MailService', () => {
       const service = await buildService({
         WEB_APP_URL: 'https://app.roamwarden.app/',
       });
-      const url = service.buildResetUrl('a b/c');
-      expect(url).toBe(
+      expect(service.buildResetUrl('a b/c')).toBe(
         'https://app.roamwarden.app/reset-password?token=a%20b%2Fc',
       );
     });
