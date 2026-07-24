@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import * as nodemailer from 'nodemailer';
 import { MailService } from './mail.service';
 import {
+  EMAIL_VERIFICATION_SUBJECT,
   PASSWORD_RESET_SUBJECT,
   WELCOME_SUBJECT,
   WAITLIST_CONFIRMATION_SUBJECT,
@@ -128,6 +129,18 @@ describe('MailService', () => {
       expect(sendMailMock).not.toHaveBeenCalled();
       expect(resendSendMock).not.toHaveBeenCalled();
     });
+
+    it('sendVerificationCode is a safe no-throw log-only (dev reads the code from logs)', async () => {
+      const service = await buildService({});
+      service.onModuleInit();
+
+      await expect(
+        service.sendVerificationCode('traveller@example.com', '123456'),
+      ).resolves.toBeUndefined();
+
+      expect(sendMailMock).not.toHaveBeenCalled();
+      expect(resendSendMock).not.toHaveBeenCalled();
+    });
   });
 
   describe('when Resend is configured', () => {
@@ -225,6 +238,35 @@ describe('MailService', () => {
       ).resolves.toBeUndefined();
 
       expect(errorSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('sends the verification code via Resend with the code and subject', async () => {
+      resendSendMock.mockResolvedValue({ data: { id: 'e-5' }, error: null });
+      const service = await buildService({ RESEND_API_KEY });
+      service.onModuleInit();
+
+      await service.sendVerificationCode('traveller@example.com', '123456');
+
+      const arg = (resendSendMock.mock.calls as Array<[SendArg]>)[0][0];
+      expect(arg.subject).toBe(EMAIL_VERIFICATION_SUBJECT);
+      expect(arg.html).toContain('123456');
+      expect(arg.text).toContain('123456');
+    });
+
+    it('RE-THROWS when the verification email fails (critical, unlike other emails)', async () => {
+      resendSendMock.mockRejectedValue(new Error('Resend network error'));
+      const service = await buildService({ RESEND_API_KEY });
+      service.onModuleInit();
+      jest
+        .spyOn(
+          (service as unknown as { logger: { error: jest.Mock } }).logger,
+          'error',
+        )
+        .mockImplementation(() => undefined);
+
+      await expect(
+        service.sendVerificationCode('traveller@example.com', '123456'),
+      ).rejects.toThrow('Resend network error');
     });
   });
 

@@ -27,3 +27,12 @@ export interface AuthTokenPair {
   accessToken: string;
   refreshToken: string;
 }
+
+/**
+ * Returned by register: no session is issued until the emailed OTP is verified.
+ * The client uses `email` to drive the verify-code screen.
+ */
+export interface PendingVerification {
+  verificationRequired: true;
+  email: string;
+}

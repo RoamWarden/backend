@@ -1,5 +1,7 @@
 import {
   BadRequestException,
+  ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   UnauthorizedException,
@@ -20,8 +22,13 @@ import type { ForgotPasswordDto } from './dto/forgot-password.dto';
 import type { LoginDto } from './dto/login.dto';
 import type { RegisterDto } from './dto/register.dto';
 import type { ResetPasswordDto } from './dto/reset-password.dto';
+import { EmailVerificationService } from './email-verification.service';
 import { TokensService } from './tokens.service';
-import type { AuthSession, AuthTokenPair } from './type/auth.types';
+import type {
+  AuthSession,
+  AuthTokenPair,
+  PendingVerification,
+} from './type/auth.types';
 
 /**
  * Email/password authentication. Passwords are bcrypt-hashed; reset tokens are
@@ -40,31 +47,49 @@ export class PasswordAuthService {
     private readonly usersService: UsersService,
     private readonly tokensService: TokensService,
     private readonly mailService: MailService,
+    private readonly emailVerification: EmailVerificationService,
   ) {}
 
-  async register(dto: RegisterDto): Promise<AuthSession> {
+  /**
+   * Creates (or refreshes an unverified) email/password account and emails a
+   * verification code. No session is issued until the code is verified — the
+   * caller must send the user to the verify-email screen with the returned email.
+   */
+  async register(dto: RegisterDto): Promise<PendingVerification> {
     const passwordHash = await bcrypt.hash(
       dto.password,
       PASSWORD_BCRYPT_ROUNDS,
     );
-    const user = await this.usersService.createLocalUser({
-      email: dto.email,
-      name: dto.name,
-      passwordHash,
-    });
 
-    // Best-effort welcome email. MailService never throws, but guard anyway so
-    // an unexpected rejection can never fail registration. Not awaited-to-throw.
-    void this.mailService
-      .sendWelcome(user.email, user.name)
-      .catch((error: unknown) => {
-        this.logger.error(
-          `Failed to send welcome email to ${user.email}`,
-          error instanceof Error ? error.stack : String(error),
+    const existing = await this.usersService.findByEmail(dto.email);
+    let user: User;
+    if (existing) {
+      if (existing.emailVerifiedAt) {
+        // A fully-registered account already owns this email.
+        throw new ConflictException(
+          'An account with this email already exists. Sign in instead.',
         );
+      }
+      // Unverified: ownership was never proven, so the latest sign-up wins.
+      user = await this.usersService.updateLocalCredentials(existing.id, {
+        name: dto.name,
+        passwordHash,
       });
+    } else {
+      user = await this.usersService.createLocalUser({
+        email: dto.email,
+        name: dto.name,
+        passwordHash,
+      });
+    }
 
-    return this.issueSession(user);
+    // Awaited-to-throw: if the code can't be emailed the user is stuck, so
+    // surface it (ServiceUnavailable) rather than pretend registration worked.
+    // No `force`: a brand-new account has no live code so its first code always
+    // sends, while re-registering an unverified email respects the resend
+    // cooldown (so /auth/register can't be used to email-bomb an address).
+    await this.emailVerification.start(user);
+    return { verificationRequired: true, email: user.email };
   }
 
   async login(dto: LoginDto): Promise<AuthSession> {
@@ -78,7 +103,23 @@ export class PasswordAuthService {
     if (!matches) {
       throw new UnauthorizedException('Incorrect email or password.');
     }
-    return this.issueSession(user);
+    if (!user.emailVerifiedAt) {
+      // Correct credentials but the email was never verified. Safe to reveal
+      // here — they just proved the password. Send a fresh code (cooldown-
+      // guarded) and signal the app to route to the verify-email screen.
+      await this.emailVerification.start(user).catch((error: unknown) => {
+        this.logger.error(
+          `Failed to send verification code during login for user ${user.id}`,
+          error instanceof Error ? error.stack : String(error),
+        );
+      });
+      throw new ForbiddenException({
+        code: 'EMAIL_NOT_VERIFIED',
+        message:
+          'Please verify your email to finish signing in — we just sent you a new code.',
+      });
+    }
+    return this.tokensService.issueSession(user);
   }
 
   async forgotPassword(dto: ForgotPasswordDto): Promise<{ message: string }> {
@@ -206,27 +247,6 @@ export class PasswordAuthService {
       user.id,
     );
     return { accessToken, refreshToken };
-  }
-
-  private async issueSession(user: User): Promise<AuthSession> {
-    const accessToken = this.tokensService.signAccessToken({
-      id: user.id,
-      email: user.email,
-    });
-    const { token: refreshToken } = await this.tokensService.issueRefreshToken(
-      user.id,
-    );
-    return {
-      accessToken,
-      refreshToken,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        avatarUrl: user.avatarUrl,
-        reputation: user.reputation,
-      },
-    };
   }
 
   private hashToken(rawToken: string): string {

@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { MailModule } from '../../providers/mail/mail.module';
 import { UsersModule } from '../user/users.module';
 import { AuthController } from './auth.controller';
+import { EmailVerificationService } from './email-verification.service';
 import { GoogleAuthService } from './google-auth.service';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { PasswordAuthService } from './password-auth.service';
@@ -17,6 +18,7 @@ import { TripShareTokenService } from './trip-share-token.service';
     TripShareTokenService,
     JwtAuthGuard,
     PasswordAuthService,
+    EmailVerificationService,
   ],
   exports: [TokensService, TripShareTokenService, JwtAuthGuard],
 })

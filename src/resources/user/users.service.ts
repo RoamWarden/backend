@@ -58,6 +58,8 @@ export class UsersService {
           email: p.email,
           name: p.name,
           avatarUrl: p.avatarUrl ?? null,
+          // Google asserts the email is verified, so these accounts skip OTP.
+          emailVerifiedAt: new Date(),
         },
         update: {
           email: p.email,
@@ -122,6 +124,29 @@ export class UsersService {
     await this.prisma.user.update({
       where: { id: userId },
       data: { passwordHash },
+    });
+  }
+
+  /**
+   * Overwrites the name + password of an as-yet-unverified local account. Used
+   * when someone re-registers an email whose OTP was never confirmed — ownership
+   * was never proven, so the latest sign-up wins.
+   */
+  updateLocalCredentials(
+    userId: string,
+    p: { name: string; passwordHash: string },
+  ): Promise<User> {
+    return this.prisma.user.update({
+      where: { id: userId },
+      data: { name: p.name, passwordHash: p.passwordHash },
+    });
+  }
+
+  /** Stamps an account as email-verified (idempotent). */
+  async markEmailVerified(userId: string, at: Date): Promise<void> {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { emailVerifiedAt: at },
     });
   }
 

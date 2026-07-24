@@ -29,6 +29,9 @@ const firstArg = <T>(mock: jest.Mock): T => {
   return calls[0][0];
 };
 
+/** `expect.any(Date)` typed as Date so it fits inside typed matcher literals. */
+const ANY_DATE = expect.any(Date) as unknown as Date;
+
 describe('UsersService', () => {
   let service: UsersService;
   let prismaMock: {
@@ -248,6 +251,8 @@ describe('UsersService', () => {
         email: 'a@b.com',
         name: 'Ada',
         avatarUrl: 'http://img/a.png',
+        // Google asserts the email is verified, so the account is pre-verified.
+        emailVerifiedAt: ANY_DATE,
       });
     });
 

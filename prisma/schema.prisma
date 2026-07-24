@@ -91,6 +91,9 @@ model User {
   googleSub    String?  @unique @map("google_sub")
   passwordHash String?  @map("password_hash")
   isAdmin      Boolean  @default(false) @map("is_admin")
+  // Null until the email is proven: email/password accounts verify via a 6-digit
+  // OTP; Google accounts arrive pre-verified (Google asserts email_verified).
+  emailVerifiedAt DateTime? @map("email_verified_at")
   email        String   @unique
   name         String
   avatarUrl    String?  @map("avatar_url")
@@ -101,6 +104,7 @@ model User {
 
   refreshTokens       RefreshToken[]
   passwordResetTokens PasswordResetToken[]
+  emailVerifications  EmailVerificationOtp[]
   trustedContacts     TrustedContact[]     @relation("owner")
   linkedAsContact     TrustedContact[]     @relation("contactUser")
   trips               Trip[]
@@ -125,6 +129,25 @@ model PasswordResetToken {
 
   @@index([userId])
   @@map("password_reset_tokens")
+}
+
+// One-time 6-digit email-verification codes. Stored only as a keyed (HMAC) hash
+// — the tiny 10^6 keyspace makes a plain hash brute-forceable, so we key it with
+// a server secret. Single-use (consumedAt), short-lived (expiresAt), and
+// attempt-limited (attemptCount) to defeat guessing.
+model EmailVerificationOtp {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  codeHash     String    @map("code_hash")
+  expiresAt    DateTime  @map("expires_at")
+  attemptCount Int       @default(0) @map("attempt_count")
+  consumedAt   DateTime? @map("consumed_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("email_verification_otps")
 }
 
 // Early-access waitlist (landing-page signups). Not tied to a user account.
