@@ -355,6 +355,7 @@ export class ReportsService {
     lat: number,
     lng: number,
     radiusM: number,
+    types?: string,
   ): Promise<ReportView[]> {
     if (!isValidLat(lat) || !isValidLng(lng)) {
       throw new BadRequestException(
@@ -371,6 +372,12 @@ export class ReportsService {
       );
     }
 
+    const typeList = this.parseTypes(types);
+    const typeFilter =
+      typeList && typeList.length > 0
+        ? Prisma.sql`AND type::text IN (${Prisma.join(typeList)})`
+        : Prisma.empty;
+
     const wkt = toWktPoint(lat, lng);
     const rows = await this.prisma.$queryRaw<ReportRow[]>(Prisma.sql`
       SELECT id, type, status, lat, lng, note,
@@ -382,6 +389,7 @@ export class ReportsService {
       WHERE status IN ('UNCONFIRMED', 'VERIFIED')
         AND expires_at > now()
         AND ST_DWithin(geog, ST_GeogFromText(${wkt}), ${radiusM})
+        ${typeFilter}
       ORDER BY created_at DESC
       LIMIT ${REPORT_QUERY_LIMIT}
     `);

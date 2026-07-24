@@ -49,6 +49,7 @@ first. Derived from `RoamWarden-Build-Plan.pdf` §9–§14.
 | notifications | `src/resources/notification/` | Firebase Admin FCM wrapper, token pruning |
 | realtime | `src/resources/realtime/` | Socket.IO gateway, Redis subscriber bridge |
 | sos | `src/resources/sos/` | `POST /sos`, `POST /sos/:id/resolve` |
+| geo | `src/resources/geo/` + `src/providers/google/` | `GET /geo/places/nearby`, `GET /geo/places/search`; `PlacesService` (Google Places proxy — key stays server-side) |
 | integration | `src/app.module.ts` | wiring: ConfigModule(validateEnv), Throttler global guard, JwtAuthGuard as APP_GUARD, Sentry, ScheduleModule |
 
 A module may ONLY create/edit files inside its own directory. Cross-module
@@ -232,6 +233,43 @@ interface SosRaisedMessage {
   raisedAt: string; // ISO
 }
 ```
+
+### GeoModule (`PlacesService` exported from `GoogleModule`)
+
+```ts
+class PlacesService {
+  /** Named places within PLACES_NEARBY_RADIUS_M (250 m) of a point. */
+  findNearby(lat: number, lng: number): Promise<Place[] | null>;
+  /** Free-text search, optionally biased to a point (PLACES_TEXT_SEARCH_RADIUS_M, 30 km). */
+  searchText(query: string, lat?: number, lng?: number): Promise<Place[] | null>;
+}
+
+interface Place {
+  id: string;      // Google place_id
+  name: string;
+  address: string; // vicinity ?? formatted_address ?? ''
+  lat: number;
+  lng: number;
+  types: string[];
+}
+```
+
+Best-effort like `DirectionsService` — NEVER throws. `null` = lookup unavailable
+(no `GOOGLE_MAPS_SERVER_API_KEY` / HTTP error / bad status, logged as a warning);
+`[]` = Google genuinely found nothing (ZERO_RESULTS). Results are capped at 12
+and Redis-cached 10 min (`keyPlacesCache(hash)`): nearby on coords rounded to
+4 dp, text search on the lowercased/trimmed query + rounded bias. The Google key
+never leaves the server — the app must call these endpoints, not Google.
+
+REST (authed via the global JWT guard, no `@Public()`):
+
+- `GET /geo/places/nearby?lat=&lng=` → `{ places: Place[], degraded: boolean }` —
+  "what is at/near this pin" for the map location picker. `degraded: true` means
+  the lookup was unavailable (`places` is then `[]`) — distinct from a real
+  empty result, so the app can fall back to raw coordinates.
+- `GET /geo/places/search?q=&lat=&lng=` → same shape — the picker's search box.
+  `q` required, 2–120 chars (trimmed); `lat`/`lng` optional bias, only applied
+  when both are present.
 
 ### Integration (app.module.ts)
 

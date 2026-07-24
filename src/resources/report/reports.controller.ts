@@ -70,7 +70,12 @@ export class ReportsController {
   /** Declared before ':id' so 'near' is not swallowed by the param route. */
   @Get('near')
   findNear(@Query() query: FindNearQueryDto): Promise<ReportView[]> {
-    return this.reportsService.findNear(query.lat, query.lng, query.radiusM);
+    return this.reportsService.findNear(
+      query.lat,
+      query.lng,
+      query.radiusM,
+      query.types,
+    );
   }
 
   @Get(':id')

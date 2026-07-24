@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { IsNumber, Max, Min } from 'class-validator';
+import { IsNumber, IsOptional, IsString, Max, Min } from 'class-validator';
 import { REPORT_NEAR_MAX_RADIUS_M } from '../constant/reports.constants';
 
 export class FindNearQueryDto {
@@ -30,4 +30,11 @@ export class FindNearQueryDto {
     message: `radiusM must be between 1 and ${REPORT_NEAR_MAX_RADIUS_M} metres.`,
   })
   radiusM!: number;
+
+  /** Optional comma-separated ReportType filter, e.g. 'ROBBERY,ACCIDENT'. */
+  @IsOptional()
+  @IsString({
+    message: 'types must be a comma-separated list of report types.',
+  })
+  types?: string;
 }

@@ -31,3 +31,6 @@ export const PATTERN_TRIP_LIVE = 'trip:live:*';
 /** Directions response cache (cost control). */
 export const keyDirectionsCache = (hash: string): string =>
   `cache:directions:${hash}`;
+
+/** Places lookup cache — nearby + text search (cost control). */
+export const keyPlacesCache = (hash: string): string => `cache:places:${hash}`;

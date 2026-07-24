@@ -13,6 +13,7 @@ import { AuthModule } from './resources/auth/auth.module';
 import { JwtAuthGuard } from './resources/auth/jwt-auth.guard';
 import { validateEnv } from './config/env.validation';
 import { LoggerModule } from './logger/logger.module';
+import { GeoModule } from './resources/geo/geo.module';
 import { GoogleModule } from './providers/google/google.module';
 import { NotificationsModule } from './resources/notification/notifications.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -59,6 +60,7 @@ import { WaitlistModule } from './resources/waitlist/waitlist.module';
     UsersModule,
     TripsModule,
     GoogleModule,
+    GeoModule,
     ReportsModule,
     AlertsModule,
     NotificationsModule,
