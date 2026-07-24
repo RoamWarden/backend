@@ -7,6 +7,7 @@ import {
   NestFastifyApplication,
 } from '@nestjs/platform-fastify';
 import { IoAdapter } from '@nestjs/platform-socket.io';
+import { Logger as PinoLogger } from 'nestjs-pino';
 import { AppModule } from './app.module';
 
 // Never let a stray async error abort the process silently (which shows up on
@@ -36,7 +37,14 @@ async function bootstrap() {
   const app = await NestFactory.create<NestFastifyApplication>(
     AppModule,
     new FastifyAdapter({ trustProxy }),
+    // Buffer framework logs until the Pino logger is wired below, so startup
+    // logs also render through Pino (pretty in dev, JSON in prod).
+    { bufferLogs: true },
   );
+
+  // Route ALL app logging (including every `new Logger(ctx)` in services)
+  // through Pino. Mirrors the fantasy-pro-league backend.
+  app.useLogger(app.get(PinoLogger));
 
   const corsOrigins = (process.env.CORS_ORIGINS ?? '')
     .split(',')

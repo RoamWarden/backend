@@ -10,6 +10,7 @@ import { AlertsModule } from './resources/alert/alerts.module';
 import { AuthModule } from './resources/auth/auth.module';
 import { JwtAuthGuard } from './resources/auth/jwt-auth.guard';
 import { validateEnv } from './config/env.validation';
+import { LoggerModule } from './logger/logger.module';
 import { GoogleModule } from './providers/google/google.module';
 import { NotificationsModule } from './resources/notification/notifications.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -41,6 +42,7 @@ import { WaitlistModule } from './resources/waitlist/waitlist.module';
     }),
     ScheduleModule.forRoot(),
     SentryModule.forRoot(),
+    LoggerModule,
     PrismaModule,
     RedisModule,
     AuthModule,
