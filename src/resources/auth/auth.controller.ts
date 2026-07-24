@@ -10,11 +10,18 @@ import { GoogleAuthDto } from './dto/google-auth.dto';
 import { LoginDto } from './dto/login.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
+import { ResendVerificationDto } from './dto/resend-verification.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
+import { VerifyEmailDto } from './dto/verify-email.dto';
+import { EmailVerificationService } from './email-verification.service';
 import { GoogleAuthService } from './google-auth.service';
 import { PasswordAuthService } from './password-auth.service';
 import { TokensService } from './tokens.service';
-import type { AuthSession, AuthTokenPair } from './type/auth.types';
+import type {
+  AuthSession,
+  AuthTokenPair,
+  PendingVerification,
+} from './type/auth.types';
 
 @Controller('auth')
 export class AuthController {
@@ -23,42 +30,16 @@ export class AuthController {
     private readonly tokensService: TokensService,
     private readonly usersService: UsersService,
     private readonly passwordAuthService: PasswordAuthService,
+    private readonly emailVerificationService: EmailVerificationService,
   ) {}
 
   @Public()
   @Throttle({ default: { limit: 20, ttl: 900000 } })
   @Post('google')
-  async google(@Body() dto: GoogleAuthDto): Promise<{
-    accessToken: string;
-    refreshToken: string;
-    user: {
-      id: string;
-      email: string;
-      name: string;
-      avatarUrl: string | null;
-      reputation: number;
-    };
-  }> {
+  async google(@Body() dto: GoogleAuthDto): Promise<AuthSession> {
     const profile = await this.googleAuthService.verify(dto.idToken);
     const user = await this.usersService.upsertFromGoogle(profile);
-    const accessToken = this.tokensService.signAccessToken({
-      id: user.id,
-      email: user.email,
-    });
-    const { token: refreshToken } = await this.tokensService.issueRefreshToken(
-      user.id,
-    );
-    return {
-      accessToken,
-      refreshToken,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        avatarUrl: user.avatarUrl,
-        reputation: user.reputation,
-      },
-    };
+    return this.tokensService.issueSession(user);
   }
 
   @Public()
@@ -82,8 +63,26 @@ export class AuthController {
   @Public()
   @Throttle({ default: { limit: 10, ttl: 900000 } })
   @Post('register')
-  register(@Body() dto: RegisterDto): Promise<AuthSession> {
+  register(@Body() dto: RegisterDto): Promise<PendingVerification> {
     return this.passwordAuthService.register(dto);
+  }
+
+  @Public()
+  @Throttle({ default: { limit: 15, ttl: 900000 } })
+  @Post('verify-email')
+  @HttpCode(HttpStatus.OK)
+  verifyEmail(@Body() dto: VerifyEmailDto): Promise<AuthSession> {
+    return this.emailVerificationService.verify(dto);
+  }
+
+  @Public()
+  @Throttle({ default: { limit: 5, ttl: 900000 } })
+  @Post('verify-email/resend')
+  @HttpCode(HttpStatus.OK)
+  resendVerification(
+    @Body() dto: ResendVerificationDto,
+  ): Promise<{ message: string }> {
+    return this.emailVerificationService.resend(dto);
   }
 
   @Public()

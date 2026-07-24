@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   UnauthorizedException,
 } from '@nestjs/common';
 import type { User } from '@prisma/client';
@@ -9,6 +10,7 @@ import { PasswordAuthService } from './password-auth.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { MailService } from '../../providers/mail/mail.service';
 import { UsersService } from '../user/users.service';
+import { EmailVerificationService } from './email-verification.service';
 import { TokensService } from './tokens.service';
 
 // Mock bcryptjs so hashing/comparison are deterministic and observable. hash
@@ -58,7 +60,7 @@ function makePrismaMock(): PrismaMock {
   return mock;
 }
 
-/** A local (email/password) user row with sane defaults. */
+/** A local (email/password) user row with sane defaults. Verified by default. */
 function makeUser(overrides: Partial<User> = {}): User {
   return {
     id: 'user-1',
@@ -67,9 +69,22 @@ function makeUser(overrides: Partial<User> = {}): User {
     avatarUrl: null,
     reputation: 0,
     passwordHash: 'hashed:current-secret',
+    emailVerifiedAt: new Date('2026-01-01T00:00:00Z'),
     ...overrides,
   } as User;
 }
+
+const SESSION = {
+  accessToken: 'access-token',
+  refreshToken: 'refresh-token',
+  user: {
+    id: 'user-1',
+    email: 'traveller@example.com',
+    name: 'Traveller',
+    avatarUrl: null,
+    reputation: 0,
+  },
+};
 
 describe('PasswordAuthService', () => {
   let prisma: PrismaMock;
@@ -77,16 +92,19 @@ describe('PasswordAuthService', () => {
     createLocalUser: jest.Mock;
     findByEmail: jest.Mock;
     findById: jest.Mock;
+    updateLocalCredentials: jest.Mock;
   };
   let tokensService: {
     signAccessToken: jest.Mock;
     issueRefreshToken: jest.Mock;
+    issueSession: jest.Mock;
   };
   let mailService: {
     buildResetUrl: jest.Mock;
     sendPasswordReset: jest.Mock;
     sendWelcome: jest.Mock;
   };
+  let emailVerification: { start: jest.Mock };
   let service: PasswordAuthService;
 
   beforeEach(() => {
@@ -98,6 +116,7 @@ describe('PasswordAuthService', () => {
       createLocalUser: jest.fn(),
       findByEmail: jest.fn(),
       findById: jest.fn(),
+      updateLocalCredentials: jest.fn(),
     };
     tokensService = {
       signAccessToken: jest.fn().mockReturnValue('access-token'),
@@ -105,6 +124,7 @@ describe('PasswordAuthService', () => {
         token: 'refresh-token',
         expiresAt: new Date(Date.now() + 3600_000),
       }),
+      issueSession: jest.fn().mockResolvedValue(SESSION),
     };
     mailService = {
       buildResetUrl: jest
@@ -113,21 +133,27 @@ describe('PasswordAuthService', () => {
       sendPasswordReset: jest.fn().mockResolvedValue(undefined),
       sendWelcome: jest.fn().mockResolvedValue(undefined),
     };
+    emailVerification = { start: jest.fn().mockResolvedValue(undefined) };
 
     service = new PasswordAuthService(
       prisma as unknown as PrismaService,
       usersService as unknown as UsersService,
       tokensService as unknown as TokensService,
       mailService as unknown as MailService,
+      emailVerification as unknown as EmailVerificationService,
     );
   });
 
   describe('register', () => {
-    it('hashes the password (stored hash != raw) and issues a token pair', async () => {
-      const user = makeUser({ passwordHash: 'hashed:s3cret-pass' });
+    it('hashes the password, creates an unverified user, starts verification, and issues NO session', async () => {
+      const user = makeUser({
+        passwordHash: 'hashed:s3cret-pass',
+        emailVerifiedAt: null,
+      });
+      usersService.findByEmail.mockResolvedValue(null);
       usersService.createLocalUser.mockResolvedValue(user);
 
-      const session = await service.register({
+      const result = await service.register({
         email: 'traveller@example.com',
         password: 's3cret-pass',
         name: 'Traveller',
@@ -144,30 +170,65 @@ describe('PasswordAuthService', () => {
       expect(storedHash).not.toBe('s3cret-pass');
       expect(storedHash).toBe('hashed:s3cret-pass');
 
-      expect(session.accessToken).toBe('access-token');
-      expect(session.refreshToken).toBe('refresh-token');
-      expect(session.user.id).toBe('user-1');
-      expect(tokensService.issueRefreshToken).toHaveBeenCalledWith('user-1');
+      // A code is sent, but NO session is minted until it's verified.
+      expect(emailVerification.start).toHaveBeenCalledWith(user);
+      expect(tokensService.issueSession).not.toHaveBeenCalled();
+      expect(result).toEqual({
+        verificationRequired: true,
+        email: 'traveller@example.com',
+      });
     });
 
-    it('propagates a ConflictException for a duplicate email', async () => {
-      usersService.createLocalUser.mockRejectedValue(
-        new ConflictException('An account with this email already exists.'),
+    it('rejects re-registering an already-verified email with ConflictException', async () => {
+      usersService.findByEmail.mockResolvedValue(
+        makeUser({ emailVerifiedAt: new Date() }),
       );
 
       await expect(
         service.register({
-          email: 'dupe@example.com',
+          email: 'traveller@example.com',
           password: 's3cret-pass',
           name: 'Dupe',
         }),
       ).rejects.toThrow(ConflictException);
+      expect(usersService.createLocalUser).not.toHaveBeenCalled();
+      expect(usersService.updateLocalCredentials).not.toHaveBeenCalled();
+      expect(emailVerification.start).not.toHaveBeenCalled();
+    });
+
+    it('lets an unverified email re-register (overwrites credentials) and re-sends a code', async () => {
+      const unverified = makeUser({ id: 'user-1', emailVerifiedAt: null });
+      const updated = makeUser({
+        id: 'user-1',
+        emailVerifiedAt: null,
+        passwordHash: 'hashed:s3cret-pass',
+      });
+      usersService.findByEmail.mockResolvedValue(unverified);
+      usersService.updateLocalCredentials.mockResolvedValue(updated);
+
+      const result = await service.register({
+        email: 'traveller@example.com',
+        password: 's3cret-pass',
+        name: 'Traveller',
+      });
+
+      expect(usersService.updateLocalCredentials).toHaveBeenCalledWith(
+        'user-1',
+        { name: 'Traveller', passwordHash: 'hashed:s3cret-pass' },
+      );
+      expect(usersService.createLocalUser).not.toHaveBeenCalled();
+      expect(emailVerification.start).toHaveBeenCalledWith(updated);
+      expect(result).toEqual({
+        verificationRequired: true,
+        email: 'traveller@example.com',
+      });
     });
   });
 
   describe('login', () => {
-    it('issues tokens on success', async () => {
-      usersService.findByEmail.mockResolvedValue(makeUser());
+    it('issues a session on success for a verified account', async () => {
+      const user = makeUser();
+      usersService.findByEmail.mockResolvedValue(user);
       bcryptCompare.mockResolvedValue(true);
 
       const session = await service.login({
@@ -179,8 +240,26 @@ describe('PasswordAuthService', () => {
         'current-secret',
         'hashed:current-secret',
       );
+      expect(tokensService.issueSession).toHaveBeenCalledWith(user);
       expect(session.accessToken).toBe('access-token');
       expect(session.refreshToken).toBe('refresh-token');
+    });
+
+    it('blocks an unverified account, sends a fresh code, and throws EMAIL_NOT_VERIFIED', async () => {
+      const user = makeUser({ emailVerifiedAt: null });
+      usersService.findByEmail.mockResolvedValue(user);
+      bcryptCompare.mockResolvedValue(true);
+
+      const err = await service
+        .login({ email: 'traveller@example.com', password: 'current-secret' })
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(ForbiddenException);
+      expect((err as ForbiddenException).getResponse()).toMatchObject({
+        code: 'EMAIL_NOT_VERIFIED',
+      });
+      expect(emailVerification.start).toHaveBeenCalledWith(user);
+      expect(tokensService.issueSession).not.toHaveBeenCalled();
     });
 
     it('throws the generic error for an unknown email', async () => {

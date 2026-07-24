@@ -1,8 +1,10 @@
 import { IsEmail, IsNotEmpty, IsString, MinLength } from 'class-validator';
 import { PASSWORD_MIN_LENGTH } from '../../../common/constants';
+import { NormalizeEmail } from '../../../common/transforms/normalize-email';
 
 export class RegisterDto {
   @IsEmail({}, { message: 'email must be a valid email address.' })
+  @NormalizeEmail()
   email!: string;
 
   @IsString({ message: 'password must be a string.' })

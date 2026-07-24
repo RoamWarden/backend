@@ -76,6 +76,32 @@ export const PASSWORD_MIN_LENGTH = 8;
 /** How long a password-reset token stays valid. */
 export const PASSWORD_RESET_TTL_S = 60 * 60;
 
+// ── email verification (OTP) ────────────────────────────────────────────────
+
+/** Number of digits in an email-verification code. */
+export const EMAIL_OTP_LENGTH = 6;
+
+/** How long a verification code stays valid (10 minutes). */
+export const EMAIL_OTP_TTL_S = 10 * 60;
+
+/** Wrong guesses allowed against a single code before it is burned. */
+export const EMAIL_OTP_MAX_ATTEMPTS = 5;
+
+/**
+ * Minimum seconds between sends for the same account. Guards against email-bomb
+ * abuse of resend / repeated unverified logins — a request inside the window is
+ * accepted (neutral response) but does not send another code.
+ */
+export const EMAIL_OTP_RESEND_COOLDOWN_S = 60;
+
+/**
+ * Per-email verification-code send quota. Unlike per-IP throttling, this caps
+ * how many codes any single address can receive per window regardless of how
+ * many IPs a sender uses — the real defence against email-bombing one victim.
+ */
+export const EMAIL_OTP_MAX_SENDS_PER_WINDOW = 5;
+export const EMAIL_OTP_SEND_WINDOW_S = 60 * 60;
+
 /** Default TTLs when env vars are absent. */
 export const DEFAULT_JWT_ACCESS_TTL = '15m';
 export const DEFAULT_JWT_REFRESH_TTL = '30d';

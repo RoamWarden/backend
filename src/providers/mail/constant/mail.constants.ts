@@ -4,6 +4,9 @@ export const PASSWORD_RESET_SUBJECT = 'Reset your RoamWarden password';
 /** Subject line for the welcome email sent after sign-up. */
 export const WELCOME_SUBJECT = 'Welcome to RoamWarden';
 
+/** Subject line for the email-verification code sent during sign-up. */
+export const EMAIL_VERIFICATION_SUBJECT = 'Your RoamWarden verification code';
+
 /** Subject line for the waitlist confirmation email. */
 export const WAITLIST_CONFIRMATION_SUBJECT = "You're on the RoamWarden list";
 

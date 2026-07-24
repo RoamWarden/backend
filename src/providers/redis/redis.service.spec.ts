@@ -10,6 +10,7 @@ import {
 // created instances off the constructor mock to assert against them.
 jest.mock('ioredis', () => {
   const makeInstance = () => ({
+    on: jest.fn(),
     connect: jest.fn().mockResolvedValue(undefined),
     quit: jest.fn().mockResolvedValue('OK'),
     duplicate: jest.fn(),
@@ -27,6 +28,7 @@ jest.mock('ioredis', () => {
 });
 
 type RedisClientMock = {
+  on: jest.Mock;
   connect: jest.Mock;
   quit: jest.Mock;
   duplicate: jest.Mock;
@@ -83,6 +85,7 @@ describe('RedisService', () => {
 
     it('onModuleDestroy quits client, publisher, and owned subscribers', async () => {
       const sub: Partial<RedisClientMock> = {
+        on: jest.fn(),
         quit: jest.fn().mockResolvedValue('OK'),
       };
       client.duplicate.mockReturnValueOnce(sub);
@@ -99,6 +102,7 @@ describe('RedisService', () => {
   describe('createSubscriber', () => {
     it('duplicates the command client and tracks it for shutdown', () => {
       const sub: Partial<RedisClientMock> = {
+        on: jest.fn(),
         quit: jest.fn().mockResolvedValue('OK'),
       };
       client.duplicate.mockReturnValueOnce(sub);

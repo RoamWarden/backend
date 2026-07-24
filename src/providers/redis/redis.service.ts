@@ -171,4 +171,30 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   async publishJson(channel: string, payload: unknown): Promise<void> {
     await this.publisher.publish(channel, JSON.stringify(payload));
   }
+
+  /**
+   * Fixed-window counter: increments `key`, setting a TTL of `windowS` on first
+   * use, and returns the new count. Returns null if Redis is unavailable so
+   * callers can fail-open (used by the per-email OTP send quota).
+   */
+  async incrementCounter(key: string, windowS: number): Promise<number | null> {
+    try {
+      const count = await this.client.incr(key);
+      if (count === 1) {
+        await this.client.expire(key, windowS);
+      }
+      return count;
+    } catch (err) {
+      const now = Date.now();
+      if (now - this.lastErrorLogAt > 30_000) {
+        this.lastErrorLogAt = now;
+        this.logger.warn(
+          `Redis counter increment failed for ${key}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+      return null;
+    }
+  }
 }

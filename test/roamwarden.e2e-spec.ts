@@ -10,8 +10,14 @@ import { App } from 'supertest/types';
 
 import { AppModule } from './../src/app.module';
 import { PrismaService } from './../src/prisma/prisma.service';
+import { MailService } from './../src/providers/mail/mail.service';
 import { GoogleAuthService } from './../src/resources/auth/google-auth.service';
 import { NotificationsService } from './../src/resources/notification/notifications.service';
+
+// The email/password flow now gates on an emailed OTP. MailService is stubbed so
+// the verification code is captured in-process (keyed by email) — the only way
+// an e2e can complete verification without a real inbox.
+const otpVerificationCodes = new Map<string, string>();
 
 // supertest's res.body is `any`; narrow it once through this helper so the
 // strict type-checked lint rules (no-unsafe-member-access) stay happy.
@@ -89,6 +95,7 @@ const FAR_AWAY = { lat: 9.0765, lng: 7.3986 }; // Abuja
 // account; the extra emails back the check-in/delete trip and the clustering /
 // moderation scenarios, each with an isolated user so ordering never collides.
 const PW_EMAIL = `e2e-pw-${RUN_ID}@roamwarden.test`;
+const PW_UNVERIFIED_EMAIL = `e2e-pw-unverified-${RUN_ID}@roamwarden.test`;
 const PW_PASSWORD = 'Sup3rSecret!';
 const PW_NAME = 'PW Tester';
 const TRIP_EMAIL = `e2e-trip-${RUN_ID}@roamwarden.test`;
@@ -107,6 +114,7 @@ const WAITLIST_ADMIN_EMAIL = `e2e-wladmin-${RUN_ID}@roamwarden.test`;
 // Every local account created by this spec — used to clean up in afterAll.
 const LOCAL_EMAILS = [
   PW_EMAIL,
+  PW_UNVERIFIED_EMAIL,
   TRIP_EMAIL,
   ...CLUSTER_EMAILS,
   MOD_REPORTER_EMAIL,
@@ -149,6 +157,19 @@ describe('RoamWarden API (e2e, live Postgres + Redis)', () => {
       })
       .overrideProvider(NotificationsService)
       .useValue({ sendToUsers: jest.fn() })
+      .overrideProvider(MailService)
+      .useValue({
+        // Capture the verification code so registerAndVerify() can complete.
+        sendVerificationCode: (email: string, code: string) => {
+          otpVerificationCodes.set(email, code);
+          return Promise.resolve();
+        },
+        sendWelcome: () => Promise.resolve(),
+        sendPasswordReset: () => Promise.resolve(),
+        sendWaitlistConfirmation: () => Promise.resolve(),
+        buildResetUrl: (token: string) =>
+          `https://app.roamwarden.test/reset-password?token=${token}`,
+      })
       .compile();
 
     app = moduleFixture.createNestApplication<NestFastifyApplication>(
@@ -204,6 +225,33 @@ describe('RoamWarden API (e2e, live Postgres + Redis)', () => {
   let reportId: string;
 
   const auth = () => `Bearer ${accessToken}`;
+
+  /**
+   * Registers a local account and completes email verification, returning the
+   * issued session. Register no longer mints a session directly — the code is
+   * captured by the stubbed MailService, then posted to /auth/verify-email.
+   */
+  const registerAndVerify = async (
+    email: string,
+    password: string,
+    name: string,
+  ): Promise<AuthBody> => {
+    const reg = await request(server)
+      .post('/auth/register')
+      .send({ email, password, name });
+    expect([200, 201]).toContain(reg.status);
+
+    const code = otpVerificationCodes.get(email);
+    if (!code) {
+      throw new Error(`No verification code was captured for ${email}`);
+    }
+
+    const verified = await request(server)
+      .post('/auth/verify-email')
+      .send({ email, code })
+      .expect(200);
+    return body<AuthBody>(verified);
+  };
 
   it('GET /health → 200 with database + redis up', async () => {
     const res = await request(server).get('/health').expect(200);
@@ -529,15 +577,11 @@ describe('RoamWarden API (e2e, live Postgres + Redis)', () => {
     await request(server).get('/waitlist').expect(401);
 
     // A freshly registered (non-admin) user is forbidden.
-    const reg = await request(server)
-      .post('/auth/register')
-      .send({
-        email: WAITLIST_ADMIN_EMAIL,
-        password: PW_PASSWORD,
-        name: 'Waitlist Admin',
-      })
-      .expect(201);
-    const adminUser = body<AuthBody>(reg);
+    const adminUser = await registerAndVerify(
+      WAITLIST_ADMIN_EMAIL,
+      PW_PASSWORD,
+      'Waitlist Admin',
+    );
 
     await request(server)
       .get('/waitlist')
@@ -564,24 +608,61 @@ describe('RoamWarden API (e2e, live Postgres + Redis)', () => {
 
   // ── email/password authentication ─────────────────────────────────────
 
-  it('POST /auth/register → 201 with tokens + user; duplicate email → 409', async () => {
-    const res = await request(server)
+  it('POST /auth/register → pending verification (no session); verify-email issues the session', async () => {
+    const reg = await request(server)
       .post('/auth/register')
-      .send({ email: PW_EMAIL, password: PW_PASSWORD, name: PW_NAME })
-      .expect(201);
+      .send({ email: PW_EMAIL, password: PW_PASSWORD, name: PW_NAME });
+    expect([200, 201]).toContain(reg.status);
 
-    const b = body<AuthBody>(res);
+    // INVARIANT: registration does NOT hand out a session — verification must
+    // happen first.
+    const pending = body<{ verificationRequired?: boolean; email?: string }>(
+      reg,
+    );
+    expect(pending.verificationRequired).toBe(true);
+    expect(pending.email).toBe(PW_EMAIL);
+    expect((reg.body as Record<string, unknown>).accessToken).toBeUndefined();
+
+    // A wrong code is rejected (and counted against the attempt cap).
+    await request(server)
+      .post('/auth/verify-email')
+      .send({ email: PW_EMAIL, code: '000000' })
+      .expect(400);
+
+    // The real (captured) code verifies the email and mints the session.
+    const code = otpVerificationCodes.get(PW_EMAIL);
+    expect(typeof code).toBe('string');
+    const verified = await request(server)
+      .post('/auth/verify-email')
+      .send({ email: PW_EMAIL, code })
+      .expect(200);
+    const b = body<AuthBody>(verified);
     expect(typeof b.accessToken).toBe('string');
     expect(typeof b.refreshToken).toBe('string');
     expect(b.user).toMatchObject({ email: PW_EMAIL, name: PW_NAME });
-    expect(typeof b.user.id).toBe('string');
 
-    // INVARIANT: an email can register exactly once.
+    // INVARIANT: a now-verified email cannot register again → 409.
     const dup = await request(server)
       .post('/auth/register')
       .send({ email: PW_EMAIL, password: PW_PASSWORD, name: PW_NAME })
       .expect(409);
     expect(body<ErrorBody>(dup).statusCode).toBe(409);
+  });
+
+  it('POST /auth/login before verification → 403 EMAIL_NOT_VERIFIED (no session)', async () => {
+    // A brand-new account that registers but never verifies.
+    const reg = await request(server).post('/auth/register').send({
+      email: PW_UNVERIFIED_EMAIL,
+      password: PW_PASSWORD,
+      name: 'Unverified',
+    });
+    expect([200, 201]).toContain(reg.status);
+
+    const blocked = await request(server)
+      .post('/auth/login')
+      .send({ email: PW_UNVERIFIED_EMAIL, password: PW_PASSWORD })
+      .expect(403);
+    expect(body<{ code?: string }>(blocked).code).toBe('EMAIL_NOT_VERIFIED');
   });
 
   it('POST /auth/login correct creds → tokens; wrong password → 401 generic', async () => {
@@ -657,11 +738,12 @@ describe('RoamWarden API (e2e, live Postgres + Redis)', () => {
 
   it('POST /trips/:id/checkin → 200 ok; then stop, DELETE → 204, GET → 404', async () => {
     // A dedicated local user + trip so this never touches the main scenario.
-    const reg = await request(server)
-      .post('/auth/register')
-      .send({ email: TRIP_EMAIL, password: PW_PASSWORD, name: 'Trip Tester' })
-      .expect(201);
-    const tripAuth = `Bearer ${body<AuthBody>(reg).accessToken}`;
+    const tripUser = await registerAndVerify(
+      TRIP_EMAIL,
+      PW_PASSWORD,
+      'Trip Tester',
+    );
+    const tripAuth = `Bearer ${tripUser.accessToken}`;
 
     const created = await request(server)
       .post('/trips')
@@ -708,11 +790,12 @@ describe('RoamWarden API (e2e, live Postgres + Redis)', () => {
     // skipped) drop the same report type at near-identical coordinates.
     const tokens: string[] = [];
     for (const email of CLUSTER_EMAILS) {
-      const reg = await request(server)
-        .post('/auth/register')
-        .send({ email, password: PW_PASSWORD, name: 'Cluster Tester' })
-        .expect(201);
-      tokens.push(body<AuthBody>(reg).accessToken);
+      const clusterUser = await registerAndVerify(
+        email,
+        PW_PASSWORD,
+        'Cluster Tester',
+      );
+      tokens.push(clusterUser.accessToken);
     }
 
     // Tiny offsets keep the three points inside REPORT_CLUSTER_RADIUS_M (300m)
@@ -745,15 +828,12 @@ describe('RoamWarden API (e2e, live Postgres + Redis)', () => {
 
   it('admin can remove a report (gone from bbox); non-admin → 403', async () => {
     // A reporter drops a report at a unique spot.
-    const rep = await request(server)
-      .post('/auth/register')
-      .send({
-        email: MOD_REPORTER_EMAIL,
-        password: PW_PASSWORD,
-        name: 'Mod Reporter',
-      })
-      .expect(201);
-    const repToken = body<AuthBody>(rep).accessToken;
+    const rep = await registerAndVerify(
+      MOD_REPORTER_EMAIL,
+      PW_PASSWORD,
+      'Mod Reporter',
+    );
+    const repToken = rep.accessToken;
 
     const created = await request(server)
       .post('/reports')
@@ -770,11 +850,11 @@ describe('RoamWarden API (e2e, live Postgres + Redis)', () => {
       .expect(403);
 
     // Promote a fresh user to admin directly in the DB.
-    const adminReg = await request(server)
-      .post('/auth/register')
-      .send({ email: ADMIN_EMAIL, password: PW_PASSWORD, name: 'Admin User' })
-      .expect(201);
-    const adminAuth = body<AuthBody>(adminReg);
+    const adminAuth = await registerAndVerify(
+      ADMIN_EMAIL,
+      PW_PASSWORD,
+      'Admin User',
+    );
     const prisma = app.get(PrismaService);
     await prisma.user.update({
       where: { id: adminAuth.user.id },

@@ -3,8 +3,10 @@ import { ConfigService } from '@nestjs/config';
 import * as nodemailer from 'nodemailer';
 import type { Transporter } from 'nodemailer';
 import { Resend } from 'resend';
+import { EMAIL_OTP_TTL_S } from '../../common/constants';
 import { DEFAULT_MAIL_FROM } from './constant/mail.constants';
 import type { ComposedEmail } from './templates/password-reset.template';
+import { emailVerificationEmail } from './templates/email-verification.template';
 import { passwordResetEmail } from './templates/password-reset.template';
 import { welcomeEmail } from './templates/welcome.template';
 import { waitlistConfirmationEmail } from './templates/waitlist.template';
@@ -94,6 +96,20 @@ export class MailService implements OnModuleInit {
   }
 
   /**
+   * Sends a 6-digit email-verification code. Unlike the other emails this one is
+   * CRITICAL: if a real provider fails to deliver it, the caller must know (the
+   * user is stuck without a code), so it re-throws when actually sending. In
+   * log-only mode it logs the code and resolves (dev can read it from the logs).
+   */
+  async sendVerificationCode(email: string, code: string): Promise<void> {
+    const ttlMinutes = Math.max(1, Math.round(EMAIL_OTP_TTL_S / 60));
+    const composed = emailVerificationEmail(code, ttlMinutes);
+    await this.dispatch(email, composed, 'verification code', {
+      critical: true,
+    });
+  }
+
+  /**
    * Dispatches a composed email via whichever provider is active. In log-only
    * mode it logs a concise line (including the key link/summary). All transport
    * calls are wrapped in try/catch so a failure is logged and never thrown.
@@ -102,6 +118,7 @@ export class MailService implements OnModuleInit {
     to: string,
     email: ComposedEmail,
     logSummary: string,
+    options?: { critical?: boolean },
   ): Promise<void> {
     if (this.mode === 'log-only') {
       this.logger.log(`[mail:log-only] to ${to} — ${logSummary}`);
@@ -131,6 +148,12 @@ export class MailService implements OnModuleInit {
         `Failed to send email (${logSummary}) to ${to}`,
         err instanceof Error ? err.stack : String(err),
       );
+      // Non-critical emails (welcome, waitlist, reset) must never break the
+      // triggering request. Critical ones (a verification code the user is
+      // waiting on) re-throw so the caller can tell the user it failed.
+      if (options?.critical) {
+        throw err;
+      }
     }
   }
 }

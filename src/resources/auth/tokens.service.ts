@@ -1,5 +1,6 @@
 import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import type { User } from '@prisma/client';
 import * as jwt from 'jsonwebtoken';
 import { createHmac, randomBytes } from 'node:crypto';
 import {
@@ -10,6 +11,7 @@ import { AccessTokenPayload } from '../../common/types/auth.types';
 import { parseDurationSeconds } from '../../common/utils/duration.util';
 import { PrismaService } from '../../prisma/prisma.service';
 import { REFRESH_TOKEN_BYTES } from './constant/auth.constants';
+import type { AuthSession } from './type/auth.types';
 
 /**
  * Access tokens: short-lived HS256 JWTs. Refresh tokens: opaque 48-byte
@@ -81,6 +83,30 @@ export class TokensService {
       type: 'access',
       iat: decoded.iat,
       exp: decoded.exp,
+    };
+  }
+
+  /**
+   * Mints a full session (access JWT + persisted refresh token) and bundles it
+   * with the public user summary. The single place register/login/verify all
+   * funnel through so a "session" always has the same shape.
+   */
+  async issueSession(user: User): Promise<AuthSession> {
+    const accessToken = this.signAccessToken({
+      id: user.id,
+      email: user.email,
+    });
+    const { token: refreshToken } = await this.issueRefreshToken(user.id);
+    return {
+      accessToken,
+      refreshToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        avatarUrl: user.avatarUrl,
+        reputation: user.reputation,
+      },
     };
   }
 
