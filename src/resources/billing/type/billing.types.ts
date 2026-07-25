@@ -1,4 +1,9 @@
 import type { SubscriptionStatus } from '@prisma/client';
+import type {
+  Entitlements,
+  PlanCapabilities,
+  PlanLimits,
+} from '../../../common/entitlements';
 
 /** Response shapes for the billing API (build plan §20). */
 
@@ -27,6 +32,17 @@ export interface PlanView {
   features: string[];
   /** Display order, ascending. The catalog is already sorted by it. */
   sortOrder: number;
+  /**
+   * What this plan INCLUDES, straight from the server's limits table — so a
+   * pricing page can render an exact comparison ("5 contacts" vs "Unlimited")
+   * instead of restating numbers in client code. `null` = unlimited.
+   *
+   * This is catalog information about the plan, NOT a grant to the caller: what
+   * the CALLER may do is `SubscriptionView.entitlements`.
+   */
+  limits: PlanLimits;
+  /** Boolean features this plan includes. Same caveat as `limits`. */
+  capabilities: PlanCapabilities;
 }
 
 /** GET /billing/plans — the public catalog. */
@@ -48,7 +64,23 @@ export interface SubscriptionView {
    * clients use it to render the "Pay now" button as visibly inert.
    */
   paymentAvailable: boolean;
+  /**
+   * What the CALLER may do: resolved limits, capabilities, and whether the
+   * server enforces them at all. Identical shape to GET /billing/entitlements,
+   * so clients model it once.
+   *
+   * While `entitlements.enforced` is false (the shipping state) clients MUST
+   * NOT cap, hide, lock or remove anything — show the numbers as information
+   * ("Free includes 5 trusted contacts"), never as a block.
+   */
+  entitlements: EntitlementsView;
 }
+
+/**
+ * GET /billing/entitlements — the caller's plan capabilities on their own.
+ * Structurally identical to `SubscriptionView.entitlements`.
+ */
+export type EntitlementsView = Entitlements;
 
 /** POST /billing/subscription — the new state plus a line to show the user. */
 export interface SelectPlanResult extends SubscriptionView {

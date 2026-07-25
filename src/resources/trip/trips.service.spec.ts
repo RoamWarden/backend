@@ -14,6 +14,7 @@ import { TokensService } from '../auth/tokens.service';
 import { TripShareTokenService } from '../auth/trip-share-token.service';
 import { UsersService } from '../user/users.service';
 import { NotificationsService } from '../notification/notifications.service';
+import { EntitlementsService } from '../../common/entitlements';
 import {
   LIVE_LINK_INVALID_MSG,
   TRIP_NOT_FOUND_MSG,
@@ -63,6 +64,17 @@ describe('TripsService', () => {
   let tripShareTokens: { issue: AnyMock; verify: AnyMock };
   let users: { filterConsentingContactUserIds: AnyMock; findById: AnyMock };
   let notifications: { sendToUsers: AnyMock };
+  let entitlements: { getWindow: AnyMock };
+
+  /** The shipping state: enforcement off ⇒ `since` null ⇒ nothing is narrowed. */
+  const unenforcedWindow = () => ({
+    key: 'tripHistoryDays' as const,
+    planCode: 'free',
+    enforced: false,
+    windowDays: 30,
+    since: null,
+    wouldApplySince: new Date('2026-06-22T08:00:00Z'),
+  });
 
   // A minimal tx object whose model methods mirror the ones createTrip touches.
   let txMock: {
@@ -153,6 +165,9 @@ describe('TripsService', () => {
       findById: jest.fn().mockResolvedValue({ id: owner.id, name: 'Ada' }),
     };
     notifications = { sendToUsers: jest.fn().mockResolvedValue(undefined) };
+    entitlements = {
+      getWindow: jest.fn().mockResolvedValue(unenforcedWindow()),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -165,6 +180,7 @@ describe('TripsService', () => {
         { provide: TripShareTokenService, useValue: tripShareTokens },
         { provide: UsersService, useValue: users },
         { provide: NotificationsService, useValue: notifications },
+        { provide: EntitlementsService, useValue: entitlements },
       ],
     }).compile();
 
@@ -289,6 +305,85 @@ describe('TripsService', () => {
       // shareUrl is built from API_BASE_URL and the issued token.
       expect(result.shareUrl).toBe(
         `https://api.roamwarden.test/trips/${created.id}/live?token=share-token`,
+      );
+    });
+  });
+
+  // ── listTrips (plan retention) ──────────────────────────────────────────
+
+  describe('listTrips', () => {
+    /** Prisma.$transaction is mocked to resolve its argument — an array here. */
+    const paged = (trips: unknown[], total: number) => {
+      prisma.$transaction.mockResolvedValueOnce([trips, total]);
+    };
+
+    it('adds NO date filter while enforcement is off — the query is unchanged', async () => {
+      paged([baseTrip()], 1);
+
+      const result = await service.listTrips(owner.id, {});
+
+      // The exact `where` the endpoint used before plans existed.
+      expect(prisma.trip.findMany).toHaveBeenCalledWith({
+        where: { userId: owner.id },
+        orderBy: { startedAt: 'desc' },
+        skip: 0,
+        take: 20,
+      });
+      expect(prisma.trip.count).toHaveBeenCalledWith({
+        where: { userId: owner.id },
+      });
+      expect(result.total).toBe(1);
+    });
+
+    it('reports the window as information: enforced false, since null', async () => {
+      paged([], 0);
+
+      const result = await service.listTrips(owner.id, {});
+
+      expect(result.retention).toEqual({
+        planCode: 'free',
+        enforced: false,
+        windowDays: 30,
+        since: null,
+        wouldApplySince: new Date('2026-06-22T08:00:00Z'),
+        coversEverything: true,
+      });
+    });
+
+    it('narrows to the window ONLY when EntitlementsService returns a cutoff', async () => {
+      const since = new Date('2026-06-25T00:00:00Z');
+      entitlements.getWindow.mockResolvedValueOnce({
+        ...unenforcedWindow(),
+        enforced: true,
+        since,
+        wouldApplySince: since,
+      });
+      paged([], 0);
+
+      const result = await service.listTrips(owner.id, {
+        status: TripStatus.COMPLETED,
+      });
+
+      expect(prisma.trip.findMany).toHaveBeenCalledWith({
+        where: {
+          userId: owner.id,
+          status: TripStatus.COMPLETED,
+          startedAt: { gte: since },
+        },
+        orderBy: { startedAt: 'desc' },
+        skip: 0,
+        take: 20,
+      });
+      expect(result.retention.coversEverything).toBe(false);
+    });
+
+    it('still caps the page size at 100 and honours page/limit', async () => {
+      paged([], 0);
+
+      await service.listTrips(owner.id, { page: 3, limit: 500 });
+
+      expect(prisma.trip.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ skip: 200, take: 100 }),
       );
     });
   });

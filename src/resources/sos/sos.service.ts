@@ -26,7 +26,15 @@ import {
   SOS_NOT_FOUND_MSG,
   TRIP_NOT_FOUND_MSG,
 } from './constant/sos.constants';
-import type { RaiseSosResult, SosRaisedMessage } from './type/sos.types';
+import { SosEscalationService } from './sos-escalation.service';
+import type {
+  RaiseSosResult,
+  SosAckResult,
+  SosPriorityInfo,
+  SosRaisedMessage,
+  SosTrailView,
+} from './type/sos.types';
+import { buildTripShareUrl } from './util/share-url';
 
 /**
  * SOS handling (build plan §14/§17).
@@ -39,6 +47,12 @@ import type { RaiseSosResult, SosRaisedMessage } from './type/sos.types';
  * step (share link, pub/sub fan-out, push) is best-effort and degrades to a
  * `warning` in the response instead of failing the request — an SOS must not
  * be lost to a notification hiccup.
+ *
+ * PRIORITY SOS (Premium `prioritySos`) is bolted on STRICTLY AFTER all of that,
+ * in `SosEscalationService`. The path below — every consenting contact alerted
+ * at once, immediately — is the standard SOS every user gets, and it is
+ * unchanged: nothing about the plan check runs before the fan-out, and nothing
+ * the follow-up does can shrink, delay or fail it. SOS is a Free-tier promise.
  */
 @Injectable()
 export class SosService {
@@ -52,6 +66,7 @@ export class SosService {
     private readonly users: UsersService,
     private readonly notifications: NotificationsService,
     private readonly tripShareTokens: TripShareTokenService,
+    private readonly escalation: SosEscalationService,
   ) {}
 
   async raise(
@@ -119,6 +134,9 @@ export class SosService {
     let shareUrl: string | undefined;
     let notifiedContactCount = 0;
     let warning: string | undefined;
+    // Captured for the priority follow-up, which runs only after this block.
+    let notifiedContactIds: string[] = [];
+    let ownerName = 'Your contact';
     try {
       if (trip) {
         const share = this.tripShareTokens.issue(
@@ -147,6 +165,7 @@ export class SosService {
         } else {
           const owner = await this.users.findById(user.id);
           const name = owner?.name ?? 'Your contact';
+          ownerName = name;
 
           const sosMessage: SosRaisedMessage = {
             sosId: event.id,
@@ -172,6 +191,7 @@ export class SosService {
             },
           });
           notifiedContactCount = contactUserIds.length;
+          notifiedContactIds = contactUserIds;
         }
       }
     } catch (err) {
@@ -182,11 +202,43 @@ export class SosService {
       warning = NOTIFY_FAILED_WARNING;
     }
 
+    // ── priority follow-up ──────────────────────────────────────────────
+    // Everything the standard SOS does is DONE by this point: the row is
+    // committed and every consenting contact has already been alerted. What
+    // follows only schedules retries and escalation for plans that include
+    // Priority SOS, and it is deliberately outside the try above so a failure
+    // here can never be mistaken for "we could not notify your contacts".
+    // It is skipped entirely when nobody was notified, so a Free user's path
+    // costs not one extra query.
+    let priority: SosPriorityInfo | undefined;
+    if (notifiedContactIds.length > 0) {
+      try {
+        priority = await this.escalation.start({
+          sosId: event.id,
+          userId: user.id,
+          ownerName,
+          contactUserIds: notifiedContactIds,
+          ...(dto.message !== undefined
+            ? { travellerMessage: dto.message }
+            : {}),
+        });
+      } catch (err) {
+        // `start` is contractually non-throwing; this is the belt to its
+        // braces. A follow-up that cannot be scheduled must never turn an
+        // SOS that WAS delivered into a failed request.
+        this.logger.error(
+          `SOS ${event.id}: contacts were alerted but the priority follow-up could not be armed`,
+          err instanceof Error ? err.stack : String(err),
+        );
+      }
+    }
+
     return {
       sosId: event.id,
       notifiedContactCount,
       ...(shareUrl !== undefined ? { shareUrl } : {}),
       ...(warning !== undefined ? { warning } : {}),
+      ...(priority !== undefined ? { priority } : {}),
     };
   }
 
@@ -211,8 +263,62 @@ export class SosService {
       where: { id: event.id },
       data: { resolvedAt },
     });
+    // The traveller is safe — stop paging their contacts. Best-effort by
+    // design (the ladder also re-checks `resolvedAt` on every tick), so a
+    // failure here can never stop someone marking themselves safe.
+    try {
+      await this.escalation.stopOnResolve(event.id);
+    } catch (err) {
+      this.logger.error(
+        `SOS ${event.id} was resolved but the escalation could not be closed — the next sweep will stop it`,
+        err instanceof Error ? err.stack : String(err),
+      );
+    }
     this.logger.log(`SOS ${event.id} resolved by user ${user.id}`);
     return { sosId: event.id, resolvedAt };
+  }
+
+  /**
+   * A trusted contact confirms they have seen the SOS, which stops the priority
+   * ladder from paging the rest of the list. It does NOT mark the traveller
+   * safe — only they can do that, with `resolve`.
+   */
+  async acknowledge(
+    contact: AuthenticatedUser,
+    sosId: string,
+  ): Promise<SosAckResult> {
+    let name = 'A trusted contact';
+    try {
+      const profile = await this.users.findById(contact.id);
+      if (profile?.name) name = profile.name;
+    } catch (err) {
+      // A missing display name must not stop an acknowledgement.
+      this.logger.warn(
+        `Could not read the name of contact ${contact.id} acknowledging SOS ${sosId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    return this.escalation.acknowledge(contact.id, sosId, name);
+  }
+
+  /**
+   * The auditable record of what actually happened: every attempt to reach
+   * every contact, in order. Owner-only — 404 for anyone else, so the trail
+   * cannot be used to probe whether someone else's SOS exists.
+   */
+  async getTrail(
+    user: AuthenticatedUser,
+    sosId: string,
+  ): Promise<SosTrailView> {
+    const event = await this.prisma.sosEvent.findUnique({
+      where: { id: sosId },
+      select: { id: true, userId: true, createdAt: true, resolvedAt: true },
+    });
+    if (!event || event.userId !== user.id) {
+      throw new NotFoundException(SOS_NOT_FOUND_MSG);
+    }
+    return this.escalation.getTrail(event);
   }
 
   // ── internals ─────────────────────────────────────────────────────────
@@ -244,10 +350,7 @@ export class SosService {
 
   /** Mirrors TripsService.buildShareUrl — the public live-view link. */
   private buildShareUrl(tripId: string, token: string): string {
-    const port = this.config.get<string | number>('PORT') ?? 3000;
-    const base =
-      this.config.get<string>('API_BASE_URL') ?? `http://localhost:${port}`;
-    return `${base.replace(/\/+$/, '')}/trips/${tripId}/live?token=${encodeURIComponent(token)}`;
+    return buildTripShareUrl(this.config, tripId, token);
   }
 
   /** Publishes on a channel, logging (never throwing) on failure. */

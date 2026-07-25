@@ -97,32 +97,58 @@ enum SubscriptionStatus {
   @@map("subscription_status")
 }
 
+/// Role inside a family/group plan. There are only two: the OWNER (exactly one
+/// per group, the account whose plan supplies the seats) and MEMBER. The owner
+/// also holds a `group_members` row, so seat counting is a single COUNT and the
+/// roster needs no special case.
+enum GroupMemberRole {
+  OWNER
+  MEMBER
+
+  @@map("group_member_role")
+}
+
+/// Lifecycle of a group invitation.
+/// PENDING  — sent, awaiting the invitee. Only actionable while `expiresAt` is
+///            in the future; expiry is computed, never a background job.
+/// ACCEPTED — the invitee opted in and a `group_members` row exists.
+/// DECLINED — the invitee said no. Re-inviting reuses (resets) the same row.
+/// REVOKED  — the owner withdrew it before it was answered.
+enum GroupInviteStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  REVOKED
+
+  @@map("group_invite_status")
+}
+
 // ─────────────────────────────── identity ───────────────────────────────
 
 model User {
-  id         String   @id @default(uuid()) @db.Uuid
+  id              String    @id @default(uuid()) @db.Uuid
   // Nullable: Google-only accounts have a googleSub and no passwordHash;
   // email/password accounts have a passwordHash and no googleSub. Either
   // identity keys the same email-unique user row.
-  googleSub    String?  @unique @map("google_sub")
-  passwordHash String?  @map("password_hash")
-  isAdmin      Boolean  @default(false) @map("is_admin")
+  googleSub       String?   @unique @map("google_sub")
+  passwordHash    String?   @map("password_hash")
+  isAdmin         Boolean   @default(false) @map("is_admin")
   // Null until the email is proven: email/password accounts verify via a 6-digit
   // OTP; Google accounts arrive pre-verified (Google asserts email_verified).
   emailVerifiedAt DateTime? @map("email_verified_at")
-  email        String   @unique
-  name         String
-  avatarUrl    String?  @map("avatar_url")
-  phone        String?
-  reputation   Int      @default(0)
-  createdAt    DateTime @default(now()) @map("created_at")
-  updatedAt    DateTime @updatedAt @map("updated_at")
+  email           String    @unique
+  name            String
+  avatarUrl       String?   @map("avatar_url")
+  phone           String?
+  reputation      Int       @default(0)
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
 
   refreshTokens       RefreshToken[]
   passwordResetTokens PasswordResetToken[]
   emailVerifications  EmailVerificationOtp[]
-  trustedContacts     TrustedContact[]     @relation("owner")
-  linkedAsContact     TrustedContact[]     @relation("contactUser")
+  trustedContacts     TrustedContact[]       @relation("owner")
+  linkedAsContact     TrustedContact[]       @relation("contactUser")
   trips               Trip[]
   reports             Report[]
   reportVotes         ReportVote[]
@@ -132,6 +158,17 @@ model User {
   // At most one subscription per user (enforced by a UNIQUE on subscriptions.user_id).
   // Absent = the user is on the free tier; we never backfill a row for everyone.
   subscription        Subscription?
+  // Family/group plan (build plan §20, Premium capability `familyPlan`).
+  // At most ONE owned group per user (UNIQUE on groups.owner_id); being a
+  // MEMBER of other people's groups is unbounded.
+  //
+  // READ THIS: neither of these relations grants any access to this user's
+  // location, trips, presence, SOS events, email or phone. Group membership is
+  // a roster and nothing else — live location still flows only through
+  // TrustedContact + UsersService.filterConsentingContactUserIds. See
+  // src/resources/group/groups.service.ts.
+  ownedGroup          Group?
+  groupMemberships    GroupMember[]
 
   @@map("users")
 }
@@ -231,40 +268,40 @@ model DeviceToken {
 // ─────────────────────────────── trips ───────────────────────────────
 
 model Trip {
-  id                String     @id @default(uuid()) @db.Uuid
-  userId            String     @map("user_id") @db.Uuid
+  id                String                                 @id @default(uuid()) @db.Uuid
+  userId            String                                 @map("user_id") @db.Uuid
   mode              TransportMode
-  status            TripStatus @default(ACTIVE)
-  originLabel       String?    @map("origin_label")
-  destLabel         String?    @map("dest_label")
-  originLat         Float      @map("origin_lat")
-  originLng         Float      @map("origin_lng")
-  destLat           Float      @map("dest_lat")
-  destLng           Float      @map("dest_lng")
+  status            TripStatus                             @default(ACTIVE)
+  originLabel       String?                                @map("origin_label")
+  destLabel         String?                                @map("dest_label")
+  originLat         Float                                  @map("origin_lat")
+  originLng         Float                                  @map("origin_lng")
+  destLat           Float                                  @map("dest_lat")
+  destLng           Float                                  @map("dest_lng")
   origin            Unsupported("geography(Point, 4326)")?
   destination       Unsupported("geography(Point, 4326)")?
-  startedAt         DateTime   @default(now()) @map("started_at")
-  endedAt           DateTime?  @map("ended_at")
-  durationS         Int?       @map("duration_s")
-  expectedDurationS Int?       @map("expected_duration_s")
+  startedAt         DateTime                               @default(now()) @map("started_at")
+  endedAt           DateTime?                              @map("ended_at")
+  durationS         Int?                                   @map("duration_s")
+  expectedDurationS Int?                                   @map("expected_duration_s")
   // Bumped whenever a fresh share token is issued; embedded in the token and
   // checked on the live view, so reissuing revokes every prior share link.
-  shareTokenVersion Int        @default(0) @map("share_token_version")
+  shareTokenVersion Int                                    @default(0) @map("share_token_version")
   // No-arrival / stall escalation state (build plan §13#4). lastPointAt tracks
   // the freshest breadcrumb; checkinAt records an "I'm OK" response;
   // overdueNotifiedAt/escalatedAt gate the escalation ladder so it fires once.
-  lastPointAt       DateTime?  @map("last_point_at")
-  checkinAt         DateTime?  @map("checkin_at")
-  overdueNotifiedAt DateTime?  @map("overdue_notified_at")
-  escalatedAt       DateTime?  @map("escalated_at")
-  createdAt         DateTime   @default(now()) @map("created_at")
-  updatedAt         DateTime   @updatedAt @map("updated_at")
+  lastPointAt       DateTime?                              @map("last_point_at")
+  checkinAt         DateTime?                              @map("checkin_at")
+  overdueNotifiedAt DateTime?                              @map("overdue_notified_at")
+  escalatedAt       DateTime?                              @map("escalated_at")
+  createdAt         DateTime                               @default(now()) @map("created_at")
+  updatedAt         DateTime                               @updatedAt @map("updated_at")
 
-  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  points   TripPoint[]
-  route    TripRoute?
-  watchers TripWatcher[]
-  alerts   Alert[]
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  points    TripPoint[]
+  route     TripRoute?
+  watchers  TripWatcher[]
+  alerts    Alert[]
   sosEvents SosEvent[]
 
   @@index([userId, status])
@@ -273,14 +310,14 @@ model Trip {
 }
 
 model TripPoint {
-  id         BigInt   @id @default(autoincrement())
-  tripId     String   @map("trip_id") @db.Uuid
+  id         BigInt                                 @id @default(autoincrement())
+  tripId     String                                 @map("trip_id") @db.Uuid
   lat        Float
   lng        Float
   speed      Float?
   heading    Float?
   accuracy   Float?
-  recordedAt DateTime @map("recorded_at")
+  recordedAt DateTime                               @map("recorded_at")
   geog       Unsupported("geography(Point, 4326)")?
 
   trip Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
@@ -290,10 +327,10 @@ model TripPoint {
 }
 
 model TripRoute {
-  tripId    String   @id @map("trip_id") @db.Uuid
+  tripId    String                                      @id @map("trip_id") @db.Uuid
   path      Unsupported("geography(LineString, 4326)")?
   source    String? // 'directions' | 'straight_line'
-  updatedAt DateTime @updatedAt @map("updated_at")
+  updatedAt DateTime                                    @updatedAt @map("updated_at")
 
   trip Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
 
@@ -317,23 +354,23 @@ model TripWatcher {
 // ─────────────────────────────── community reports ───────────────────────────────
 
 model Report {
-  id           String       @id @default(uuid()) @db.Uuid
-  reporterId   String       @map("reporter_id") @db.Uuid
-  type         ReportType
-  status       ReportStatus @default(UNCONFIRMED)
-  lat          Float
-  lng          Float
-  geog         Unsupported("geography(Point, 4326)")?
-  note         String?
-  confirmCount Int          @default(0) @map("confirm_count")
-  denyCount    Int          @default(0) @map("deny_count")
-  createdAt    DateTime     @default(now()) @map("created_at")
-  expiresAt    DateTime     @map("expires_at")
+  id            String                                 @id @default(uuid()) @db.Uuid
+  reporterId    String                                 @map("reporter_id") @db.Uuid
+  type          ReportType
+  status        ReportStatus                           @default(UNCONFIRMED)
+  lat           Float
+  lng           Float
+  geog          Unsupported("geography(Point, 4326)")?
+  note          String?
+  confirmCount  Int                                    @default(0) @map("confirm_count")
+  denyCount     Int                                    @default(0) @map("deny_count")
+  createdAt     DateTime                               @default(now()) @map("created_at")
+  expiresAt     DateTime                               @map("expires_at")
   // Moderation audit (build plan §16/§17). Set when an admin removes a report;
   // removedById is a plain admin user id (no FK back-relation on purpose).
-  removedById     String?   @map("removed_by_id") @db.Uuid
-  removedReason   String?   @map("removed_reason")
-  removedAt       DateTime? @map("removed_at")
+  removedById   String?                                @map("removed_by_id") @db.Uuid
+  removedReason String?                                @map("removed_reason")
+  removedAt     DateTime?                              @map("removed_at")
 
   reporter User         @relation(fields: [reporterId], references: [id], onDelete: Cascade)
   votes    ReportVote[]
@@ -386,11 +423,121 @@ model SosEvent {
   createdAt  DateTime  @default(now()) @map("created_at")
   resolvedAt DateTime? @map("resolved_at")
 
-  user User  @relation(fields: [userId], references: [id], onDelete: Cascade)
-  trip Trip? @relation(fields: [tripId], references: [id], onDelete: SetNull)
+  user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trip       Trip?          @relation(fields: [tripId], references: [id], onDelete: SetNull)
+  deliveries SosDelivery[]
+  escalation SosEscalation?
 
   @@index([userId])
   @@map("sos_events")
+}
+
+/// Outcome of ONE attempt to reach ONE contact about ONE SOS.
+/// SENT         — handed to the push provider (delivery to the handset is not guaranteed).
+/// NO_DEVICE    — the contact has no registered device, so there was nothing to deliver to.
+/// FAILED       — the attempt itself errored.
+/// SKIPPED      — deliberately not attempted (e.g. already acknowledged).
+/// ACKNOWLEDGED — the contact told us they saw it.
+enum SosDeliveryStatus {
+  SENT
+  NO_DEVICE
+  FAILED
+  SKIPPED
+  ACKNOWLEDGED
+
+  @@map("sos_delivery_status")
+}
+
+/// How an attempt was carried (PUSH = FCM, REALTIME = live socket fan-out).
+enum SosDeliveryChannel {
+  PUSH
+  REALTIME
+
+  @@map("sos_delivery_channel")
+}
+
+/// Lifecycle of the Priority-SOS escalation ladder for one SOS event.
+/// RUNNING      — still working through the contact list.
+/// ACKNOWLEDGED — a contact confirmed they saw it; paging stops.
+/// RESOLVED     — the traveller marked themselves safe; paging stops.
+/// EXHAUSTED    — the ladder ran out of contacts/attempts/time.
+/// STOPPED      — halted for another reason (recorded in `detail`).
+enum SosEscalationStatus {
+  RUNNING
+  ACKNOWLEDGED
+  RESOLVED
+  EXHAUSTED
+  STOPPED
+
+  @@map("sos_escalation_status")
+}
+
+/// APPEND-ONLY audit trail: every attempt made to reach a contact about an SOS,
+/// including the immediate broadcast (round 0) and each Priority escalation
+/// round. Rows are never updated — "what did we actually do, and when" must
+/// stay answerable afterwards.
+///
+/// `contactUserId` deliberately has NO foreign key: the trail records who we
+/// tried to reach at the time, and must survive that account being deleted.
+model SosDelivery {
+  id            String             @id @default(uuid()) @db.Uuid
+  sosId         String             @map("sos_id") @db.Uuid
+  contactUserId String             @map("contact_user_id") @db.Uuid
+  /// Position in the trusted-contact ladder (0-based). The broadcast wave uses
+  /// the same positions, so the trail reads as one story per contact.
+  rank          Int
+  /// 0 = the immediate broadcast every SOS does; 1..n = Priority escalation rounds.
+  round         Int
+  /// 1-based attempt counter for this contact across the whole SOS.
+  attempt       Int
+  channel       SosDeliveryChannel
+  status        SosDeliveryStatus
+  /// Whether this attempt came from the Priority ladder (vs the standard wave).
+  priority      Boolean            @default(false)
+  /// Human-readable reason, shown in the traveller's SOS trail.
+  detail        String?
+  createdAt     DateTime           @default(now()) @map("created_at")
+
+  sos SosEvent @relation(fields: [sosId], references: [id], onDelete: Cascade)
+
+  @@index([sosId, createdAt])
+  @@index([sosId, contactUserId])
+  @@map("sos_deliveries")
+}
+
+/// Durable state of the Priority-SOS ladder for one SOS — also the queue the
+/// cron sweeper drains, so a redeploy or crash cannot lose an in-flight
+/// escalation the way an in-process timer would.
+model SosEscalation {
+  id             String              @id @default(uuid()) @db.Uuid
+  sosId          String              @unique @map("sos_id") @db.Uuid
+  userId         String              @map("user_id") @db.Uuid
+  status         SosEscalationStatus @default(RUNNING)
+  /// Entitled plan code at raise time — audit of WHY this SOS got the ladder.
+  planCode       String              @map("plan_code")
+  /// Whether plan enforcement was on at raise time.
+  enforced       Boolean             @default(false)
+  /// Frozen ladder: consenting contact userIds, in the order they are paged.
+  contactOrder   String[]            @map("contact_order")
+  /// Current ladder position (index into `contactOrder`).
+  rank           Int                 @default(0)
+  /// Attempts already made at `rank` (drives the retry backoff).
+  attempt        Int                 @default(0)
+  /// Attempts made across the whole ladder — the absolute "stop paging" cap,
+  /// and the `round` stamped on the next trail row (round 0 = the broadcast).
+  totalAttempts  Int                 @default(0) @map("total_attempts")
+  /// When the sweeper should act next. NULL once the ladder is terminal.
+  nextAttemptAt  DateTime?           @map("next_attempt_at")
+  acknowledgedBy String?             @map("acknowledged_by") @db.Uuid
+  detail         String?
+  startedAt      DateTime            @default(now()) @map("started_at")
+  updatedAt      DateTime            @updatedAt @map("updated_at")
+  finishedAt     DateTime?           @map("finished_at")
+
+  sos SosEvent @relation(fields: [sosId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt])
+  @@map("sos_escalations")
 }
 
 // ─────────────────────────────── billing ───────────────────────────────
@@ -445,4 +592,99 @@ model Subscription {
   @@index([status])
   @@index([planId])
   @@map("subscriptions")
+}
+
+// ─────────────────────── family / group plan (§20) ───────────────────────
+//
+// PRIVACY CONTRACT — read before adding a column or a query here.
+//
+// A group is a ROSTER. Being in one, on its own, exposes NOTHING about a
+// member beyond their display name and avatar. It grants no location, no
+// trip (live or past), no presence, no SOS visibility, no email and no phone.
+// There is deliberately NO foreign key from any group table to trips, points,
+// presence or SOS.
+//
+// Location sharing keeps flowing exclusively through TrustedContact plus the
+// mutual-consent gate (UsersService.filterConsentingContactUserIds): both
+// people must have added each other. A group can therefore only ever NARROW
+// that audience (an intersection), never widen it. Anything that fans a
+// location out to "the group" must go through
+// GroupsService.getConsentingGroupMemberUserIds, which is exactly that
+// intersection.
+//
+// Seats come from the OWNER's plan (`familyMembers`: free 0, premium 6,
+// owner included) and are REPORTED, not applied, while ENFORCE_PLAN_LIMITS is
+// off — which is the shipping state.
+
+/// One family/group plan. At most one per owner (UNIQUE on owner_id): seats are
+/// a per-plan resource, so N groups × N seats would make the limit meaningless.
+model Group {
+  id        String   @id @default(uuid()) @db.Uuid
+  /// The account whose plan supplies the seats. Also holds an OWNER member row.
+  ownerId   String   @unique @map("owner_id") @db.Uuid
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Cascade: deleting an account disbands the group it owns, and takes the
+  // roster and every outstanding invitation with it (GDPR delete stays a
+  // single user.delete).
+  owner   User          @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  members GroupMember[]
+  invites GroupInvite[]
+
+  @@map("groups")
+}
+
+/// A user's seat in a group. A row EXISTS only because that user accepted an
+/// invitation (or created the group) — nobody is ever added by email alone.
+model GroupMember {
+  id       String          @id @default(uuid()) @db.Uuid
+  groupId  String          @map("group_id") @db.Uuid
+  userId   String          @map("user_id") @db.Uuid
+  role     GroupMemberRole @default(MEMBER)
+  joinedAt DateTime        @default(now()) @map("joined_at")
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // One seat per user per group — enforced by the database, not app logic, so a
+  // double-accept race can never consume two seats.
+  @@unique([groupId, userId])
+  @@index([userId])
+  @@map("group_members")
+}
+
+/// An INVITATION — an offer, not a membership. It carries only the invited
+/// email address and NO foreign key to a user account, on purpose:
+///
+///  • inviting must never reveal to the inviter whether that address has a
+///    RoamWarden account (account enumeration), and
+///  • an unanswered invitation must never link a real person to a group they
+///    have not agreed to join.
+///
+/// The row becomes a membership only when a signed-in user whose OWN verified
+/// email matches accepts it.
+model GroupInvite {
+  id          String            @id @default(uuid()) @db.Uuid
+  groupId     String            @map("group_id") @db.Uuid
+  /// Normalised (trimmed + lowercased) — matched against users.email exactly.
+  email       String
+  status      GroupInviteStatus @default(PENDING)
+  /// Invitations rot: an unanswered one stops being actionable after this.
+  /// Expiry is COMPUTED at read time — no cron, nothing to fall behind on.
+  expiresAt   DateTime          @map("expires_at")
+  respondedAt DateTime?         @map("responded_at")
+  createdAt   DateTime          @default(now()) @map("created_at")
+  updatedAt   DateTime          @updatedAt @map("updated_at")
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  // One invitation row per address per group, for the lifetime of the group:
+  // re-inviting after a decline/revoke RESETS this row rather than piling up
+  // history a user cannot see or clear.
+  @@unique([groupId, email])
+  // "Which groups have invited me?" — the invitee's inbox query.
+  @@index([email, status])
+  @@map("group_invites")
 }

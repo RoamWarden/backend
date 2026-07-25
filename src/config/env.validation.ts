@@ -149,6 +149,28 @@ export class EnvironmentVariables {
   @IsInt()
   @Min(1)
   RATE_LIMIT_MAX?: number;
+
+  /**
+   * MASTER SWITCH for plan-limit ENFORCEMENT (build plan §20). Unset defaults to
+   * FALSE, and false is the shipping state: there is no payment gateway, so
+   * nobody can hold an ACTIVE paid subscription, so enforcing Free limits would
+   * only take capabilities away from users who cannot buy them back.
+   *
+   * While it is off, every user keeps everything they can do today — limits are
+   * computed, returned to clients and logged, but never applied. Flip it to
+   * 'true' only once checkout is live. Validated rather than left free-form so a
+   * typo ('yes', 'TRUE ') fails at boot with a clear message instead of quietly
+   * meaning something.
+   */
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.trim().toLowerCase() : value,
+  )
+  @IsIn(['true', 'false'], {
+    message:
+      'ENFORCE_PLAN_LIMITS must be "true" or "false" (leave it unset or false until billing is live — true takes features away from users on the Free plan).',
+  })
+  ENFORCE_PLAN_LIMITS?: string;
 }
 
 export function validateEnv(

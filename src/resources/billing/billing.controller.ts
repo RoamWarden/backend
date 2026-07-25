@@ -13,6 +13,7 @@ import type { AuthenticatedUser } from '../../common/types/auth.types';
 import { BillingService } from './billing.service';
 import { SelectPlanDto } from './dto/select-plan.dto';
 import type {
+  EntitlementsView,
   PlanCatalogResult,
   PortalLinkResult,
   SelectPlanResult,
@@ -41,6 +42,21 @@ export class BillingController {
     @CurrentUser() user: AuthenticatedUser,
   ): Promise<SubscriptionView> {
     return this.billingService.getSubscription(user.id);
+  }
+
+  /**
+   * The caller's limits and capabilities on their own — the cheap read for a
+   * client that only needs to know what to SHOW. Identical shape to the
+   * `entitlements` object inside GET /billing/subscription.
+   *
+   * `enforced` is false while ENFORCE_PLAN_LIMITS is off (the shipping state):
+   * clients must then treat every number as information, never as a lock.
+   */
+  @Get('entitlements')
+  getEntitlements(
+    @CurrentUser() user: AuthenticatedUser,
+  ): Promise<EntitlementsView> {
+    return this.billingService.getEntitlements(user.id);
   }
 
   /**

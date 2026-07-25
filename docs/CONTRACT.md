@@ -36,6 +36,7 @@ first. Derived from `RoamWarden-Build-Plan.pdf` §9–§14 and §20 (monetizatio
 | `haversineMeters`, `toWktPoint`, `toWktLineString`, `isValidLat/Lng` | `src/common/utils/geo.util` | |
 | `parseDurationSeconds` | `src/common/utils/duration.util` | |
 | `validateEnv` | `src/config/env.validation` | wired into `ConfigModule.forRoot` by integration |
+| `EntitlementsService` | `src/common/entitlements` | plan limits/capabilities + the `assert*` guards; `@Global`, inject it anywhere. ENFORCEMENT IS OFF BY DEFAULT — see EntitlementsModule below |
 
 ## Module ownership map
 
@@ -50,7 +51,7 @@ first. Derived from `RoamWarden-Build-Plan.pdf` §9–§14 and §20 (monetizatio
 | realtime | `src/resources/realtime/` | Socket.IO gateway, Redis subscriber bridge |
 | sos | `src/resources/sos/` | `POST /sos`, `POST /sos/:id/resolve` |
 | geo | `src/resources/geo/` + `src/providers/google/` | `GET /geo/places/nearby`, `GET /geo/places/search`; `PlacesService` (Google Places proxy — key stays server-side) |
-| billing | `src/resources/billing/` | `GET /billing/plans`, `GET/POST /billing/subscription`, `POST /billing/portal-link`; `BillingService`, `isPremiumEntitled` |
+| billing | `src/resources/billing/` + `src/common/entitlements/` | `GET /billing/plans`, `GET/POST /billing/subscription`, `GET /billing/entitlements`, `POST /billing/portal-link`; `BillingService`, `isPremiumEntitled`, `EntitlementsService` (plan limits + the enforcement switch) |
 | integration | `src/app.module.ts` | wiring: ConfigModule(validateEnv), Throttler global guard, JwtAuthGuard as APP_GUARD, Sentry, ScheduleModule |
 
 A module may ONLY create/edit files inside its own directory. Cross-module
@@ -346,7 +347,9 @@ class BillingService {
   /** 'free' → FREE now; a priced plan → PENDING, never ACTIVE. */
   selectPlan(userId: string, planCode: string): Promise<SelectPlanResult>;
   createPortalLink(userId: string): Promise<{ url: string; expiresAt: Date }>;
-  /** The ONE entitlement question. Nothing is gated on it yet. */
+  /** The caller's limits/capabilities. Delegates to EntitlementsService. */
+  getEntitlements(userId: string): Promise<EntitlementsView>;
+  /** The coarse question. Prefer EntitlementsService for anything specific. */
   isPremium(userId: string): Promise<boolean>;
 }
 
@@ -365,6 +368,8 @@ interface PlanView {
   priceFormatted: string;    // server-formatted: 'Free' | '$5.00' — clients append '/mo'
   features: string[];        // marketing bullets, rendered verbatim in order
   sortOrder: number;
+  limits: PlanLimits;              // what this PLAN includes (catalog info, not a grant)
+  capabilities: PlanCapabilities;  // ditto — lets a pricing page compare tiers exactly
 }
 
 interface SubscriptionView {
@@ -374,6 +379,7 @@ interface SubscriptionView {
   cancelAtPeriodEnd: boolean;
   isPremium: boolean;              // false while PENDING — nobody paid
   paymentAvailable: boolean;       // ALWAYS false until a gateway exists
+  entitlements: EntitlementsView;  // what the CALLER may do (same shape as GET /billing/entitlements)
 }
 
 interface SelectPlanResult extends SubscriptionView { message: string }
@@ -391,7 +397,12 @@ REST:
   `sortOrder`. An empty catalog is a misconfiguration, not a product decision →
   503 with a clear message (never a silently empty pricing page).
 - `GET /billing/subscription` — authed → 200 `SubscriptionView`. A user with no
-  row resolves to the free plan with `status: 'FREE'`.
+  row resolves to the free plan with `status: 'FREE'`. Carries `entitlements`
+  (see EntitlementsModule) so one call tells a client both the plan and the
+  limits.
+- `GET /billing/entitlements` — authed → 200 `EntitlementsView`. The same object
+  as `SubscriptionView.entitlements`, on its own, for clients that only need to
+  know what to SHOW. Never 404s (no row → Free).
 - `POST /billing/subscription` — authed, body `{ planCode }` (the ONLY accepted
   field — `forbidNonWhitelisted` rejects extras). Trimmed + lowercased, then
   validated against the catalog; unknown code → 400 naming the codes that exist.
@@ -407,6 +418,127 @@ REST:
   via `POST /auth/handoff` for a normal session. The app must NEVER put its own
   access/refresh token in a URL.
 
+### EntitlementsModule (`@Global`, exports: `EntitlementsService`)
+
+`src/common/entitlements/` — plan limits and the enforcement switch. Import path
+for everyone: `import { EntitlementsService } from '<rel>/common/entitlements';`
+**No module import needed** — EntitlementsModule is `@Global` and BillingModule
+registers it, so injecting the service is enough.
+
+**THE ONE RULE: `ENFORCE_PLAN_LIMITS` DEFAULTS TO FALSE, AND FALSE MEANS NOTHING
+IS TAKEN AWAY.** While it is off, `assert*` never throws, `WindowCheck.since` is
+always `null`, and every user keeps exactly what they can do today. The checks
+still compute and RETURN what they *would* have blocked (`wouldBlock`) and log it
+at debug tagged `[plan-limits][shadow]`. Never gate on `enforced` yourself and
+never re-derive a limit — call the helpers and use their answer.
+
+```ts
+class EntitlementsService {
+  /** Resolved entitlements for a user. No subscription row → Free. Memoized ~5s. */
+  getEntitlements(userId: string): Promise<Entitlements>;
+  /** Same, from a row you already loaded (no query). null = no row = Free. */
+  entitlementsFor(s: { planCode: string; status: SubscriptionStatus } | null): Entitlements;
+  /** What a CATALOG plan includes (pricing pages). Not a grant to anyone. */
+  planEntitlements(planCode: string): PlanEntitlements;
+
+  /** Read-only. NEVER throws. `currentCount` = what they have BEFORE adding one. */
+  checkLimit(userId: string, key: CountLimitKey, currentCount: number): Promise<LimitCheck>;
+  /** The guard. Throws 403 ONLY while enforcement is ON; otherwise returns the check. */
+  assertWithinLimit(userId: string, key: CountLimitKey, currentCount: number): Promise<LimitCheck>;
+
+  checkCapability(userId: string, key: CapabilityKey): Promise<CapabilityCheck>;
+  assertCapability(userId: string, key: CapabilityKey): Promise<CapabilityCheck>;
+
+  /** Window limits (trip history). `since` is null unless enforcement is ON. */
+  getWindow(userId: string, key: WindowLimitKey): Promise<WindowCheck>;
+
+  isEnforced(): boolean;
+  /** Call after changing a user's plan. BillingService.selectPlan already does. */
+  invalidate(userId: string): void;
+}
+
+type CountLimitKey = 'trustedContacts' | 'familyMembers';
+type WindowLimitKey = 'tripHistoryDays';
+type CapabilityKey = 'analytics' | 'prioritySos' | 'familyPlan' | 'offlineMaps';
+
+/** null ALWAYS means UNLIMITED — never Infinity, never -1 (JSON-safe). */
+type LimitValue = number | null;
+type PlanLimits = {
+  trustedContacts: LimitValue;
+  tripHistoryDays: LimitValue;
+  familyMembers: LimitValue;
+};
+type PlanCapabilities = Record<CapabilityKey, boolean>;
+
+interface Entitlements {           // === EntitlementsView on the wire
+  planCode: string;                // plan on the subscription row ('free' when none)
+  entitledPlanCode: string;        // plan whose limits APPLY — 'free' unless ACTIVE paid
+  status: 'FREE' | 'PENDING' | 'ACTIVE' | 'CANCELLED' | 'EXPIRED';
+  isPremium: boolean;              // entitledPlanCode !== 'free'
+  limits: PlanLimits;
+  capabilities: PlanCapabilities;
+  enforced: boolean;               // false today; while false clients MUST NOT lock anything
+}
+
+interface LimitCheck {
+  key: CountLimitKey;
+  planCode: string;                // the entitled plan the numbers came from
+  enforced: boolean;
+  limit: LimitValue;               // null = unlimited
+  current: number;                 // what you passed, floored at 0
+  remaining: LimitValue;           // null = unlimited; never negative
+  allowed: boolean;                // ALWAYS true while enforced is false
+  wouldBlock: boolean;             // what enforcement WOULD have done
+  message: string | null;          // human copy, set whenever wouldBlock
+}
+
+interface CapabilityCheck {
+  key: CapabilityKey; planCode: string; enforced: boolean;
+  granted: boolean;                // does the plan include it
+  allowed: boolean;                // ALWAYS true while enforced is false
+  wouldBlock: boolean; message: string | null;
+}
+
+interface WindowCheck {
+  key: WindowLimitKey; planCode: string; enforced: boolean;
+  windowDays: LimitValue;          // null = unlimited
+  since: Date | null;              // APPLY this; null = no cutoff (unlimited OR not enforced)
+  wouldApplySince: Date | null;    // what would apply if enforced — safe to show, never to hide
+}
+```
+
+The limits table (`src/common/entitlements/entitlement.constants.ts`, keyed by
+`plans.code` — add a plan = add a catalog row + an entry here):
+
+| key | free | premium | meaning |
+|---|---|---|---|
+| `trustedContacts` | 5 | unlimited (`null`) | contacts a user may have |
+| `tripHistoryDays` | 30 | unlimited (`null`) | how far back trip history/analytics may read |
+| `familyMembers` | 0 | 6 | seats in a family/group plan, owner included |
+| `analytics` | false | true | trip history & analytics |
+| `prioritySos` | false | true | priority SOS handling |
+| `familyPlan` | false | true | family/group plan |
+| `offlineMaps` | false | true | offline maps |
+
+Usage, exactly as intended:
+
+```ts
+// countable limit — pass the CURRENT count, before adding
+const check = await this.entitlements.assertWithinLimit(userId, 'trustedContacts', count);
+// ...proceed. With the flag off this line is always reached.
+
+// window limit — one expression, correct in both modes
+const { since } = await this.entitlements.getWindow(userId, 'tripHistoryDays');
+where: { startedAt: since ? { gte: since } : undefined }
+```
+
+When enforcement IS on, `assert*` throws 403 with a human `message` plus
+machine-readable fields: `{ code: 'PLAN_LIMIT_REACHED', limitKey, limit, current,
+planCode, upgradeTo }` or `{ code: 'PLAN_UPGRADE_REQUIRED', capability, planCode,
+upgradeTo }`. If the entitlement lookup itself fails, `check*`/`assert*` FAIL
+OPEN (`allowed: true`, `enforced: false`, warning logged) — a plan check must
+never break a safety feature.
+
 ### Integration (app.module.ts)
 
 - `ConfigModule.forRoot({ isGlobal: true, validate: validateEnv })`
@@ -415,6 +547,10 @@ REST:
 - `JwtAuthGuard` as APP_GUARD (after throttler).
 - `ScheduleModule.forRoot()`, `SentryModule` + `SentryGlobalFilter` (`@sentry/nestjs/setup`).
 - Health: keep `GET /health` public; extend to report db/redis status.
+- `ENFORCE_PLAN_LIMITS` (`'true' | 'false'`, default false) is the plan-limit
+  master switch. It MUST stay false until checkout is live — true takes features
+  away from users who cannot buy them back. No app.module wiring is needed:
+  `EntitlementsModule` is `@Global` and BillingModule registers it.
 - `WEB_APP_URL` is the website origin (password-reset page + the `/account` area).
   The account area is a browser page calling this API cross-origin, so whenever
   `CORS_ORIGINS` is set that origin MUST be in it, or the account page gets a CORS
@@ -426,3 +562,9 @@ Nest defaults (`{ statusCode, message, error }`). `message` must tell a human
 what happened and what to do. 401 invalid/expired token; 403 not yours; 404
 missing; 409 conflicting state (e.g. second active trip); 422 domain rejection
 (geo-implausible report); 429 throttled.
+
+One 403 carries extra fields: a plan limit blocked by `EntitlementsService`
+adds `code` (`'PLAN_LIMIT_REACHED'` | `'PLAN_UPGRADE_REQUIRED'`), `planCode`,
+`upgradeTo`, and the numbers. It CANNOT occur while `ENFORCE_PLAN_LIMITS` is off
+(the default), so clients may treat it as a future case — but if they handle it,
+show `message` and route to the account area.

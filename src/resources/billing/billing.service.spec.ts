@@ -1,10 +1,12 @@
 import {
   BadRequestException,
+  Logger,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
 import { Prisma, SubscriptionStatus } from '@prisma/client';
 import type { Plan, Subscription } from '@prisma/client';
+import { EntitlementsService } from '../../common/entitlements';
 import { PrismaService } from '../../prisma/prisma.service';
 import { HandoffTokenService } from '../auth/handoff-token.service';
 import { BillingService } from './billing.service';
@@ -81,6 +83,7 @@ type PrismaMock = {
 describe('BillingService', () => {
   let prisma: PrismaMock;
   let handoffTokens: { issue: jest.Mock };
+  let entitlements: EntitlementsService;
   let service: BillingService;
   const env: Record<string, string> = {
     WEB_APP_URL: 'https://roamwarden.example/',
@@ -92,9 +95,16 @@ describe('BillingService', () => {
     const config = {
       get: jest.fn((key: string) => values[key]),
     } as unknown as ConfigService;
+    // The real EntitlementsService, not a stub: the entitlements embedded in
+    // every billing response must be the ones the rest of the backend enforces.
+    entitlements = new EntitlementsService(
+      prisma as unknown as PrismaService,
+      config,
+    );
     service = new BillingService(
       prisma as unknown as PrismaService,
       handoffTokens as unknown as HandoffTokenService,
+      entitlements,
       config,
     );
   }
@@ -118,7 +128,14 @@ describe('BillingService', () => {
         expiresAt: new Date('2026-07-25T00:05:00.000Z'),
       }),
     };
+    // Boot-time INFO lines (one per service built) would drown the output.
+    // Warnings and errors still print — they are the ones worth seeing.
+    jest.spyOn(Logger.prototype, 'log').mockImplementation();
     build();
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
   });
 
   describe('getPlans', () => {
@@ -145,8 +162,18 @@ describe('BillingService', () => {
         priceFormatted: 'Free',
         features: ['Core safety alerts', 'Basic trip sharing', 'SOS'],
         sortOrder: 0,
+        // What the plan INCLUDES, so a pricing page never restates numbers.
+        limits: { trustedContacts: 5, tripHistoryDays: 30, familyMembers: 0 },
+        capabilities: {
+          analytics: false,
+          prioritySos: false,
+          familyPlan: false,
+          offlineMaps: false,
+        },
       });
       expect(result.plans[1].priceFormatted).toBe('$5.00');
+      expect(result.plans[1].limits.trustedContacts).toBeNull(); // unlimited
+      expect(result.plans[1].capabilities.offlineMaps).toBe(true);
       // The catalog row id is an internal detail; clients key off `code`.
       expect(result.plans[0]).not.toHaveProperty('id');
     });
@@ -187,6 +214,22 @@ describe('BillingService', () => {
       expect(result.cancelAtPeriodEnd).toBe(false);
       expect(result.isPremium).toBe(false);
       expect(result.paymentAvailable).toBe(false);
+      // Entitlements ride along so the app can SHOW the plan without guessing —
+      // and `enforced: false` says plainly that nothing is capped today.
+      expect(result.entitlements).toEqual({
+        planCode: FREE_PLAN_CODE,
+        entitledPlanCode: FREE_PLAN_CODE,
+        status: SubscriptionStatus.FREE,
+        isPremium: false,
+        limits: { trustedContacts: 5, tripHistoryDays: 30, familyMembers: 0 },
+        capabilities: {
+          analytics: false,
+          prioritySos: false,
+          familyPlan: false,
+          offlineMaps: false,
+        },
+        enforced: false,
+      });
     });
 
     it('reports a PENDING paid plan as NOT premium and payment as unavailable', async () => {
@@ -204,6 +247,11 @@ describe('BillingService', () => {
       expect(result.isPremium).toBe(false);
       expect(result.paymentAvailable).toBe(false);
       expect(result.currentPeriodEnd).toBeNull();
+      // Selected premium, entitled to free — PENDING grants nothing.
+      expect(result.entitlements.planCode).toBe(PREMIUM_PLAN_CODE);
+      expect(result.entitlements.entitledPlanCode).toBe(FREE_PLAN_CODE);
+      expect(result.entitlements.limits.trustedContacts).toBe(5);
+      expect(result.entitlements.capabilities.offlineMaps).toBe(false);
     });
 
     it('reports an ACTIVE paid plan as premium (the shape a real gateway would produce)', async () => {
@@ -223,6 +271,9 @@ describe('BillingService', () => {
       expect(result.isPremium).toBe(true);
       expect(result.currentPeriodEnd).toBe(periodEnd);
       expect(result.cancelAtPeriodEnd).toBe(true);
+      expect(result.entitlements.entitledPlanCode).toBe(PREMIUM_PLAN_CODE);
+      expect(result.entitlements.limits.trustedContacts).toBeNull();
+      expect(result.entitlements.capabilities.prioritySos).toBe(true);
     });
 
     it('fails loudly when the free plan is missing from the catalog', async () => {
@@ -410,6 +461,43 @@ describe('BillingService', () => {
       });
 
       await expect(service.isPremium('user-1')).resolves.toBe(true);
+    });
+  });
+
+  describe('getEntitlements', () => {
+    it('returns the free limits for a user with no subscription row, unenforced', async () => {
+      prisma.subscription.findUnique.mockResolvedValue(null);
+
+      const result = await service.getEntitlements('user-1');
+
+      expect(result.planCode).toBe(FREE_PLAN_CODE);
+      expect(result.limits.trustedContacts).toBe(5);
+      expect(result.limits.tripHistoryDays).toBe(30);
+      // The whole point: the server is not capping anything yet.
+      expect(result.enforced).toBe(false);
+    });
+
+    it('drops the cached entitlements when the plan changes, so the next read is fresh', async () => {
+      prisma.subscription.findUnique.mockResolvedValue(null);
+      await service.getEntitlements('user-1');
+
+      prisma.plan.findFirst.mockResolvedValue(PREMIUM_PLAN);
+      prisma.subscription.upsert.mockResolvedValue(
+        makeSubscription({
+          planId: PREMIUM_PLAN.id,
+          status: SubscriptionStatus.PENDING,
+        }),
+      );
+      await service.selectPlan('user-1', PREMIUM_PLAN_CODE);
+
+      prisma.subscription.findUnique.mockResolvedValue({
+        status: SubscriptionStatus.PENDING,
+        plan: { code: PREMIUM_PLAN_CODE },
+      });
+      const after = await service.getEntitlements('user-1');
+
+      expect(after.planCode).toBe(PREMIUM_PLAN_CODE);
+      expect(prisma.subscription.findUnique).toHaveBeenCalledTimes(2);
     });
   });
 

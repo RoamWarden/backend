@@ -20,6 +20,7 @@ import { CreateTripDto } from './dto/create-trip.dto';
 import { ListTripsQueryDto } from './dto/list-trips.query.dto';
 import { LiveViewQueryDto } from './dto/live-view.query.dto';
 import { StopTripDto } from './dto/stop-trip.dto';
+import { TripStatsService } from './trip-stats.service';
 import { TripsService } from './trips.service';
 
 /** Rejects malformed trip ids before they reach Prisma/raw SQL. */
@@ -32,7 +33,10 @@ const tripIdPipe = new ParseUUIDPipe({
 
 @Controller('trips')
 export class TripsController {
-  constructor(private readonly trips: TripsService) {}
+  constructor(
+    private readonly trips: TripsService,
+    private readonly stats: TripStatsService,
+  ) {}
 
   @Post()
   createTrip(
@@ -48,6 +52,24 @@ export class TripsController {
     @Query() query: ListTripsQueryDto,
   ): ReturnType<TripsService['listTrips']> {
     return this.trips.listTrips(user.id, query);
+  }
+
+  /**
+   * Trip history & analytics (Premium capability `analytics`).
+   *
+   * MUST stay above `@Get(':id')` — Nest matches routes in declaration order, so
+   * below it "stats" would be swallowed by the id param and rejected as a
+   * malformed UUID.
+   *
+   * While ENFORCE_PLAN_LIMITS is off (today) this answers for EVERY user; the
+   * `analytics` capability check travels in the body so the client can label it
+   * as Premium rather than pretend it is locked.
+   */
+  @Get('stats')
+  getStats(
+    @CurrentUser() user: AuthenticatedUser,
+  ): ReturnType<TripStatsService['getStats']> {
+    return this.stats.getStats(user.id);
   }
 
   @Get(':id')

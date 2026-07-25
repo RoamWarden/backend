@@ -14,6 +14,7 @@ import {
   AUTO_ARRIVAL_RADIUS_M,
   TRIP_POINTS_MAX_BATCH,
 } from '../../common/constants';
+import { EntitlementsService } from '../../common/entitlements';
 import { AuthenticatedUser } from '../../common/types/auth.types';
 import {
   haversineMeters,
@@ -41,6 +42,7 @@ import {
 import type {
   LiveViewReport,
   RouteGeoJsonRow,
+  TripHistoryWindow,
   TripPointView,
 } from './type/trips.types';
 
@@ -57,6 +59,7 @@ export class TripsService {
     private readonly tripShareTokens: TripShareTokenService,
     private readonly users: UsersService,
     private readonly notifications: NotificationsService,
+    private readonly entitlements: EntitlementsService,
   ) {}
 
   // ── contract exports (used by realtime + sos) ─────────────────────────
@@ -444,15 +447,39 @@ export class TripsService {
 
   // ── queries ───────────────────────────────────────────────────────────
 
+  /**
+   * The paginated history.
+   *
+   * PLAN RETENTION (build plan §20, `tripHistoryDays`): the plan's window is
+   * reported on every response as `retention`, and applied via `window.since` —
+   * which EntitlementsService returns as null whenever ENFORCE_PLAN_LIMITS is
+   * off. That is the shipping state, so the `where` below is identical to the
+   * one that existed before plans did, and no user loses a single trip. When the
+   * switch is flipped, `since` becomes a date and this same line narrows the
+   * window; there is no second code path to keep in sync.
+   *
+   * Only the LIST and the STATS are narrowed. `GET /trips/:id` is deliberately
+   * not — refusing to open a trip the user already has a link to would take away
+   * more than the plan promises, and it is their own data either way.
+   */
   async listTrips(
     userId: string,
     query: ListTripsQueryDto,
-  ): Promise<{ trips: Trip[]; total: number; page: number; limit: number }> {
+  ): Promise<{
+    trips: Trip[];
+    total: number;
+    page: number;
+    limit: number;
+    retention: TripHistoryWindow;
+  }> {
     const page = query.page ?? 1;
     const limit = Math.min(query.limit ?? 20, 100);
+    const window = await this.entitlements.getWindow(userId, 'tripHistoryDays');
     const where: Prisma.TripWhereInput = {
       userId,
       ...(query.status ? { status: query.status } : {}),
+      // `since` is null unless enforcement is on ⇒ no filter at all today.
+      ...(window.since ? { startedAt: { gte: window.since } } : {}),
     };
     const [trips, total] = await this.prisma.$transaction([
       this.prisma.trip.findMany({
@@ -463,7 +490,20 @@ export class TripsService {
       }),
       this.prisma.trip.count({ where }),
     ]);
-    return { trips, total, page, limit };
+    return {
+      trips,
+      total,
+      page,
+      limit,
+      retention: {
+        planCode: window.planCode,
+        enforced: window.enforced,
+        windowDays: window.windowDays,
+        since: window.since,
+        wouldApplySince: window.wouldApplySince,
+        coversEverything: window.since === null,
+      },
+    };
   }
 
   async getTrip(

@@ -8,6 +8,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { Prisma, SubscriptionStatus } from '@prisma/client';
 import type { Plan, Subscription } from '@prisma/client';
+import { EntitlementsService } from '../../common/entitlements';
 import { PrismaService } from '../../prisma/prisma.service';
 import { HandoffTokenService } from '../auth/handoff-token.service';
 import {
@@ -19,6 +20,7 @@ import {
 } from './constant/billing.constants';
 import { isPremiumEntitled } from './entitlements';
 import type {
+  EntitlementsView,
   PlanCatalogResult,
   PlanView,
   PortalLinkResult,
@@ -57,6 +59,7 @@ export class BillingService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly handoffTokens: HandoffTokenService,
+    private readonly entitlements: EntitlementsService,
     config: ConfigService,
   ) {
     // Same resolution order as the password-reset link (MailService): the web
@@ -162,6 +165,9 @@ export class BillingService {
     };
 
     const subscription = await this.upsertSubscription(userId, data);
+    // The user's plan just changed — drop any memoized entitlements so the very
+    // next read reflects it instead of waiting for the memo to expire.
+    this.entitlements.invalidate(userId);
 
     return {
       ...this.toSubscriptionView(plan, subscription),
@@ -186,20 +192,24 @@ export class BillingService {
   }
 
   /**
-   * "Is this user premium?" — the accessor other modules inject when they need
-   * to gate a feature. Nothing is gated on it yet (that is a separate change);
-   * the single source of truth for the rule itself is `isPremiumEntitled`.
+   * The caller's resolved entitlements — limits, capabilities and whether the
+   * server enforces them (it does not, by default). Same object clients get
+   * nested under `SubscriptionView.entitlements`.
+   */
+  getEntitlements(userId: string): Promise<EntitlementsView> {
+    return this.entitlements.getEntitlements(userId);
+  }
+
+  /**
+   * "Is this user premium?" — the coarse accessor. Prefer
+   * `EntitlementsService.getEntitlements` (or its `assert*` guards) when you
+   * need a specific limit: they answer with numbers, and they respect the
+   * enforcement switch. The single source of truth for the rule itself is
+   * `isPremiumEntitled`; this delegates so both paths share one query and memo.
    */
   async isPremium(userId: string): Promise<boolean> {
-    const subscription = await this.prisma.subscription.findUnique({
-      where: { userId },
-      select: { status: true, plan: { select: { code: true } } },
-    });
-    return isPremiumEntitled(
-      subscription
-        ? { planCode: subscription.plan.code, status: subscription.status }
-        : null,
-    );
+    const entitlements = await this.entitlements.getEntitlements(userId);
+    return entitlements.isPremium;
   }
 
   /**
@@ -254,6 +264,9 @@ export class BillingService {
   }
 
   private toPlanView(plan: Plan): PlanView {
+    // Catalog information: what this plan includes, for comparison tables. It
+    // says nothing about what the CALLER may do — that is `entitlements`.
+    const included = this.entitlements.planEntitlements(plan.code);
     return {
       code: plan.code,
       name: plan.name,
@@ -264,6 +277,8 @@ export class BillingService {
       priceFormatted: this.formatPrice(plan.priceAmountMinor, plan.currency),
       features: plan.features,
       sortOrder: plan.sortOrder,
+      limits: included.limits,
+      capabilities: included.capabilities,
     };
   }
 
@@ -274,6 +289,11 @@ export class BillingService {
       'status' | 'currentPeriodEnd' | 'cancelAtPeriodEnd'
     >,
   ): SubscriptionView {
+    // Resolved from the row we already loaded — no second query.
+    const entitlements = this.entitlements.entitlementsFor({
+      planCode: plan.code,
+      status: subscription.status,
+    });
     return {
       plan: this.toPlanView(plan),
       status: subscription.status,
@@ -284,6 +304,7 @@ export class BillingService {
         status: subscription.status,
       }),
       paymentAvailable: this.paymentAvailable,
+      entitlements,
     };
   }
 

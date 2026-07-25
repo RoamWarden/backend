@@ -16,6 +16,7 @@ import { validateEnv } from './config/env.validation';
 import { LoggerModule } from './logger/logger.module';
 import { GeoModule } from './resources/geo/geo.module';
 import { GoogleModule } from './providers/google/google.module';
+import { GroupsModule } from './resources/group/groups.module';
 import { NotificationsModule } from './resources/notification/notifications.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { RealtimeModule } from './resources/realtime/realtime.module';
@@ -69,6 +70,7 @@ import { WaitlistModule } from './resources/waitlist/waitlist.module';
     SosModule,
     WaitlistModule,
     BillingModule,
+    GroupsModule,
   ],
   controllers: [AppController],
   providers: [

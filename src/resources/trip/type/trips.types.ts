@@ -1,3 +1,33 @@
+import type { LimitValue } from '../../../common/entitlements';
+
+/**
+ * How far back a caller's trip history reaches, and how far their plan SAYS it
+ * may reach (build plan §20, `tripHistoryDays`).
+ *
+ * Reported by both `GET /trips` and `GET /trips/stats`. `since` is the cutoff
+ * ACTUALLY applied and is null while ENFORCE_PLAN_LIMITS is off — the shipping
+ * state — so everyone sees their entire history. `wouldApplySince` is what the
+ * cutoff would be if the switch were on: safe to display ("Free covers the last
+ * 30 days"), because showing a window is not the same as hiding trips.
+ *
+ * A CLIENT MUST NEVER TRIM THE LIST ITSELF. If the server sent a row, the user
+ * is entitled to see it.
+ */
+export interface TripHistoryWindow {
+  /** The plan whose window applies (the entitled plan). */
+  planCode: string;
+  /** Whether the window is enforced right now. False today. */
+  enforced: boolean;
+  /** The plan's window in days; null = unlimited. */
+  windowDays: LimitValue;
+  /** The cutoff actually applied. null = none: everything is included. */
+  since: Date | null;
+  /** The cutoff that WOULD apply if enforcement were on; null when unlimited. */
+  wouldApplySince: Date | null;
+  /** True when nothing was cut off (`since === null`). */
+  coversEverything: boolean;
+}
+
 export interface TripPointView {
   lat: number;
   lng: number;
