@@ -24,6 +24,24 @@ export const googleEmailLinkedElsewhere = (email: string): string =>
 export const googleEmailNotVerified = (email: string): string =>
   `Google hasn't confirmed that ${email} belongs to you, so we can't connect it to the existing RoamWarden account. Verify the address with Google, or sign in with your email and password instead.`;
 
+/**
+ * Machine-readable code for "that Google identity has no RoamWarden account and
+ * this caller is not allowed to create one" (login-only sign-in, i.e. the
+ * website). Shipped in the error BODY, alongside a human `message`, exactly like
+ * the login flow's `EMAIL_NOT_VERIFIED` — clients branch on the code, never on
+ * the sentence. Deliberately NOT a bare 401: web clients read 401 as "dead
+ * session" and would bounce into a refresh/redirect loop.
+ */
+export const GOOGLE_NO_ACCOUNT_CODE = 'NO_ACCOUNT';
+
+/**
+ * Accounts are built in the RoamWarden app — that is where the email is
+ * verified, the push token is registered and trusted contacts are added. A
+ * web-created account would be a half-configured shell, so we send them there.
+ */
+export const googleNoAccount = (email: string): string =>
+  `There's no RoamWarden account for ${email} yet. Create one in the RoamWarden app first — that's where your email is verified and your trusted contacts are set up — then come back and sign in with Google.`;
+
 /** Safe linked-user projection: never expose the linked user's email or phone. */
 export const CONTACT_USER_SELECT = {
   contactUser: { select: { id: true, name: true, avatarUrl: true } },

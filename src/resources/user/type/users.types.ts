@@ -18,6 +18,20 @@ export interface GoogleIdentity {
   emailVerified: boolean;
 }
 
+/** Options for {@link UsersService.upsertFromGoogle}. */
+export interface GoogleUpsertOptions {
+  /**
+   * May a verified Google identity that matches no existing user CREATE an
+   * account? Defaults to `true` — the mobile app's behaviour, unchanged.
+   *
+   * `false` is login-only mode (the website): an unknown identity is refused
+   * with 404 `{ code: 'NO_ACCOUNT' }` and nothing is written. It does NOT
+   * affect accounts that already exist — signing in, and linking Google onto an
+   * email + password account, work identically in both modes.
+   */
+  allowSignup?: boolean;
+}
+
 /** Trusted contact plus the safe subset of its linked user's profile. */
 export type ContactWithLinkedUser = Prisma.TrustedContactGetPayload<{
   include: typeof CONTACT_USER_SELECT;

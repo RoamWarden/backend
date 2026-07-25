@@ -20,12 +20,15 @@ import {
   CONTACT_NOT_FOUND,
   CONTACT_USER_SELECT,
   DUPLICATE_LINKED_CONTACT,
+  GOOGLE_NO_ACCOUNT_CODE,
   googleEmailLinkedElsewhere,
   googleEmailNotVerified,
+  googleNoAccount,
 } from './constant/users.constants';
 import type {
   ContactWithLinkedUser,
   GoogleIdentity,
+  GoogleUpsertOptions,
   ProfileWithCounts,
   UserProfile,
 } from './type/users.types';
@@ -52,11 +55,24 @@ export class UsersService {
    *  2. Nobody has that sub, but the email already exists on an account with no
    *     googleSub → LINK: stamp the sub onto that account and sign them in. The
    *     passwordHash is left untouched, so email/password keeps working too.
-   *  3. Email is free → create a fresh Google account.
+   *  3. Email is free → create a fresh Google account, UNLESS the caller is in
+   *     login-only mode (`allowSignup: false`), in which case nothing is
+   *     written and a 404 `{ code: 'NO_ACCOUNT' }` is thrown.
    *
    * Only a *different, non-null* googleSub on that email is a real conflict.
+   *
+   * Steps 1 and 2 are identical in both modes: resolving to an account that
+   * already exists is a SIGN-IN, never a sign-up, so login-only mode must not
+   * weaken the email_verified gate or the password-revocation rule in
+   * {@link linkGoogleIdentity}.
    */
-  async upsertFromGoogle(p: GoogleIdentity): Promise<User> {
+  async upsertFromGoogle(
+    p: GoogleIdentity,
+    options: GoogleUpsertOptions = {},
+  ): Promise<User> {
+    // Default true: the mobile app calls this with no options and must keep
+    // creating accounts on first Google sign-in exactly as before.
+    const allowSignup = options.allowSignup ?? true;
     const email = normalizeEmail(p.email);
 
     const bySub = await this.prisma.user.findUnique({
@@ -66,6 +82,20 @@ export class UsersService {
 
     const byEmail = await this.prisma.user.findUnique({ where: { email } });
     if (byEmail) return this.linkGoogleIdentity(byEmail, p, email);
+
+    if (!allowSignup) {
+      // Nobody owns this sub and nobody owns this email, so continuing would
+      // CREATE an account. On the web that account would be a shell: no verified
+      // email flow, no push token, no trusted contacts. Refuse before any write
+      // and hand back a code the caller can branch on.
+      this.logger.log(
+        `Login-only Google sign-in refused for ${email}: no RoamWarden account exists`,
+      );
+      throw new NotFoundException({
+        code: GOOGLE_NO_ACCOUNT_CODE,
+        message: googleNoAccount(email),
+      });
+    }
 
     try {
       return await this.prisma.user.create({

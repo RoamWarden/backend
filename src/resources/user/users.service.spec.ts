@@ -15,8 +15,10 @@ import {
   CONTACT_NEEDS_REACHABLE_FIELD,
   CONTACT_USER_SELECT,
   DUPLICATE_LINKED_CONTACT,
+  GOOGLE_NO_ACCOUNT_CODE,
   googleEmailLinkedElsewhere,
   googleEmailNotVerified,
+  googleNoAccount,
 } from './constant/users.constants';
 import type { GoogleIdentity } from './type/users.types';
 
@@ -551,6 +553,138 @@ describe('UsersService', () => {
       await expect(
         service.upsertFromGoogle(identity({ email: 'taken@b.com' })),
       ).rejects.toThrow(googleEmailLinkedElsewhere('taken@b.com'));
+    });
+
+    // ── login-only mode (the website) ────────────────────────────────────────
+    //
+    // The web must never mint an account: accounts are built in the app, where
+    // the email is verified, the push token registered and trusted contacts
+    // added. Signing IN — including linking onto a password account — is
+    // unchanged; only creation is off.
+
+    describe('allowSignup', () => {
+      it('creates a brand-new account when the caller passes no options (app behaviour)', async () => {
+        noExistingUser();
+        prismaMock.user.create.mockResolvedValue({ id: 'u1' });
+
+        await expect(service.upsertFromGoogle(identity())).resolves.toEqual({
+          id: 'u1',
+        });
+        expect(prismaMock.user.create).toHaveBeenCalledTimes(1);
+      });
+
+      it('creates a brand-new account when allowSignup is explicitly true', async () => {
+        noExistingUser();
+        prismaMock.user.create.mockResolvedValue({ id: 'u1' });
+
+        await expect(
+          service.upsertFromGoogle(identity(), { allowSignup: true }),
+        ).resolves.toEqual({ id: 'u1' });
+        expect(prismaMock.user.create).toHaveBeenCalledTimes(1);
+      });
+
+      it('allowSignup:false + unknown identity writes NOTHING and throws NO_ACCOUNT', async () => {
+        noExistingUser();
+
+        const err = await service
+          .upsertFromGoogle(identity({ email: 'Ada@B.com' }), {
+            allowSignup: false,
+          })
+          .catch((e: unknown) => e);
+
+        expect(err).toBeInstanceOf(NotFoundException);
+        // Machine-readable code + a human sentence, exactly like the login
+        // flow's EMAIL_NOT_VERIFIED. Never a bare 401: the web reads that as a
+        // dead session and would loop through refresh/redirect.
+        expect((err as NotFoundException).getResponse()).toEqual({
+          code: GOOGLE_NO_ACCOUNT_CODE,
+          message: googleNoAccount('ada@b.com'),
+        });
+        expect((err as NotFoundException).getStatus()).toBe(404);
+        // Both lookups ran, then it stopped — no row created or touched.
+        expect(prismaMock.user.findUnique).toHaveBeenCalledTimes(2);
+        expect(prismaMock.user.create).not.toHaveBeenCalled();
+        expect(prismaMock.user.update).not.toHaveBeenCalled();
+      });
+
+      it('allowSignup:false signs in an existing Google user', async () => {
+        const existing = { id: 'u1', googleSub: 'sub-123', email: 'old@b.com' };
+        const refreshed = { ...existing, email: 'ada@b.com' };
+        prismaMock.user.findUnique.mockResolvedValueOnce(existing);
+        prismaMock.user.update.mockResolvedValue(refreshed);
+
+        await expect(
+          service.upsertFromGoogle(identity(), { allowSignup: false }),
+        ).resolves.toBe(refreshed);
+        expect(prismaMock.user.create).not.toHaveBeenCalled();
+      });
+
+      it('allowSignup:false LINKS an existing password account and signs it in', async () => {
+        const verifiedAt = new Date('2026-01-01T00:00:00.000Z');
+        const passwordAccount = {
+          id: 'u1',
+          email: 'ada@b.com',
+          googleSub: null,
+          passwordHash: 'argon2-hash',
+          emailVerifiedAt: verifiedAt,
+          avatarUrl: null,
+          name: 'Ada',
+        };
+        const linked = { ...passwordAccount, googleSub: 'sub-123' };
+        prismaMock.user.findUnique
+          .mockResolvedValueOnce(null) // nobody owns the sub
+          .mockResolvedValueOnce(passwordAccount); // …but the email exists
+        prismaMock.user.update.mockResolvedValue(linked);
+
+        await expect(
+          service.upsertFromGoogle(identity(), { allowSignup: false }),
+        ).resolves.toBe(linked);
+
+        // Matching an existing account is a SIGN-IN, not a sign-up.
+        expect(prismaMock.user.create).not.toHaveBeenCalled();
+        const arg = firstArg<Prisma.UserUpdateArgs>(prismaMock.user.update);
+        expect(arg.where).toEqual({ id: 'u1' });
+        expect(arg.data).toMatchObject({ googleSub: 'sub-123' });
+        // Verified account → its password survives the link, as before.
+        expect(arg.data).not.toHaveProperty('passwordHash');
+      });
+
+      it('allowSignup:false keeps the email_verified gate when linking', async () => {
+        prismaMock.user.findUnique
+          .mockResolvedValueOnce(null)
+          .mockResolvedValueOnce({ id: 'u1', googleSub: null });
+
+        await expect(
+          service.upsertFromGoogle(
+            identity({ email: 'victim@b.com', emailVerified: false }),
+            { allowSignup: false },
+          ),
+        ).rejects.toThrow(googleEmailNotVerified('victim@b.com'));
+        expect(prismaMock.user.update).not.toHaveBeenCalled();
+        expect(prismaMock.user.create).not.toHaveBeenCalled();
+      });
+
+      it('allowSignup:false still revokes an UNPROVEN password when linking', async () => {
+        const unverifiedAccount = {
+          id: 'u1',
+          email: 'ada@b.com',
+          googleSub: null,
+          passwordHash: 'argon2-hash',
+          emailVerifiedAt: null,
+          avatarUrl: null,
+          name: 'Ada',
+        };
+        prismaMock.user.findUnique
+          .mockResolvedValueOnce(null)
+          .mockResolvedValueOnce(unverifiedAccount);
+        prismaMock.user.update.mockResolvedValue({ id: 'u1' });
+
+        await service.upsertFromGoogle(identity(), { allowSignup: false });
+
+        const arg = firstArg<Prisma.UserUpdateArgs>(prismaMock.user.update);
+        // Pre-hijacking defence is untouched by login-only mode.
+        expect(arg.data.passwordHash).toBeNull();
+      });
     });
   });
 

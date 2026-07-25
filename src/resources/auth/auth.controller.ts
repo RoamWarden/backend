@@ -36,12 +36,24 @@ export class AuthController {
     private readonly handoffTokenService: HandoffTokenService,
   ) {}
 
+  /**
+   * Google Sign-In for the app AND the website.
+   *
+   * `allowSignup` is forwarded verbatim: the default (undefined → true) lives in
+   * UsersService so exactly one place decides it. The app sends only `idToken`
+   * and keeps creating an account on first sign-in; the website sends `false`,
+   * which turns an unknown identity into a 404 `{ code: 'NO_ACCOUNT' }` with
+   * nothing written. An identity that resolves to an existing account signs in
+   * in both modes.
+   */
   @Public()
   @Throttle({ default: { limit: 20, ttl: 900000 } })
   @Post('google')
   async google(@Body() dto: GoogleAuthDto): Promise<AuthSession> {
     const profile = await this.googleAuthService.verify(dto.idToken);
-    const user = await this.usersService.upsertFromGoogle(profile);
+    const user = await this.usersService.upsertFromGoogle(profile, {
+      allowSignup: dto.allowSignup,
+    });
     return this.tokensService.issueSession(user);
   }
 

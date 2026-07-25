@@ -88,10 +88,41 @@ class HandoffTokenService {
 
 - `JwtAuthGuard` honours `@Public()`; on success sets `request.user: AuthenticatedUser`.
 - Refresh tokens: 48 random bytes base64url, stored as sha256 hex in `refresh_tokens.token_hash`.
-- `POST /auth/google` body `{ idToken }` → verifies against ALL configured Google client ids
-  (web/ios/android; audience check), upserts user by `googleSub`, returns
-  `{ accessToken, refreshToken, user }`. If no Google client id is configured →
-  503 with a clear "Google Sign-In not configured" message.
+- `POST /auth/google` — `@Public()`, throttled 20/15 min. Body
+  `{ idToken, allowSignup?: boolean }` → verifies against ALL configured Google
+  client ids (web/ios/android; audience check), resolves the user by `googleSub`
+  → then by email, and returns 201 `{ accessToken, refreshToken, user }` (the
+  same `AuthSession` shape as login; `user` = `{ id, email, name, avatarUrl, reputation }`).
+  If no Google client id is configured → 503 with a clear "Google Sign-In not
+  configured" message.
+  - Resolution order (identical in both modes): known `googleSub` → sign in and
+    refresh name/email/avatar; else the email exists → **LINK** the Google
+    identity onto that account (including an email + password one) and sign in;
+    else create.
+  - `allowSignup` **defaults to `true`**. The app sends only `{ idToken }` and is
+    unchanged: an unknown identity creates a pre-verified account.
+  - `allowSignup: false` is LOGIN-ONLY mode, for the website. If the verified
+    identity matches NO existing user (no `googleSub` match AND no account with
+    that email) nothing is written and the response is
+    **404** with body **verbatim**:
+    ```json
+    { "code": "NO_ACCOUNT", "message": "There's no RoamWarden account for ada@example.com yet. Create one in the RoamWarden app first — that's where your email is verified and your trusted contacts are set up — then come back and sign in with Google." }
+    ```
+    Note the body is exactly `{ code, message }` (no `statusCode`/`error` keys) —
+    same shape as login's `403 { code: 'EMAIL_NOT_VERIFIED' }`. Clients branch on
+    `code`, never on the sentence, and must render `message` as-is. It is
+    deliberately NOT a 401: web clients treat 401 as a dead session and would
+    loop through refresh/redirect.
+  - Login-only mode changes ONLY account creation. Linking still succeeds, and
+    still enforces both guards: Google's `email_verified` must be true (else 401
+    `googleEmailNotVerified`), and linking onto an account that never verified its
+    own email revokes that unproven `passwordHash` (pre-hijacking defence). An
+    email already owned by a DIFFERENT `googleSub` is still 409.
+  - `allowSignup` must be a real JSON boolean. The global pipe's
+    `enableImplicitConversion` would turn the string `"false"` into `true`, so the
+    DTO re-reads the raw value and rejects anything non-boolean — `"false"`, `0`,
+    `null` — with a 400 rather than failing open. Only an ABSENT field means
+    "default to true".
 - `POST /auth/handoff` — `@Public()`, throttled 20/15 min. Body `{ token }` (the
   `handoff` query param the app put in the account URL) → 200
   `{ accessToken, refreshToken, user }`, the SAME shape as login. Hand-off tokens:
@@ -107,7 +138,17 @@ class HandoffTokenService {
 ```ts
 class UsersService {
   findById(id: string): Promise<User | null>;
-  upsertFromGoogle(p: { sub: string; email: string; name: string; avatarUrl?: string }): Promise<User>;
+  /**
+   * sub → email → create. `options.allowSignup` defaults to true (the app);
+   * false = login-only (the website): an identity that matches no existing user
+   * throws NotFoundException({ code: 'NO_ACCOUNT', message }) BEFORE any write.
+   * Resolving to an existing account is a sign-in in both modes, with the
+   * email_verified gate and unproven-password revocation unchanged.
+   */
+  upsertFromGoogle(
+    p: { sub: string; email: string; name: string; avatarUrl?: string; emailVerified: boolean },
+    options?: { allowSignup?: boolean },
+  ): Promise<User>;
   getTrustedContacts(userId: string): Promise<TrustedContact[]>;
   /** userIds of contacts that are linked app users (contactUserId != null) */
   getContactUserIds(userId: string): Promise<string[]>;
