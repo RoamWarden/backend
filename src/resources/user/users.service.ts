@@ -4,6 +4,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import type { DeviceToken, TrustedContact, User } from '@prisma/client';
@@ -19,9 +20,12 @@ import {
   CONTACT_NOT_FOUND,
   CONTACT_USER_SELECT,
   DUPLICATE_LINKED_CONTACT,
+  googleEmailLinkedElsewhere,
+  googleEmailNotVerified,
 } from './constant/users.constants';
 import type {
   ContactWithLinkedUser,
+  GoogleIdentity,
   ProfileWithCounts,
   UserProfile,
 } from './type/users.types';
@@ -42,46 +46,61 @@ export class UsersService {
   }
 
   /**
-   * Login upsert keyed on the immutable Google `sub`: first login creates the
-   * user; later logins refresh email/name/avatarUrl from Google's profile.
+   * Resolves a verified Google identity to a user row, in priority order:
+   *
+   *  1. Known `googleSub` → normal sign-in; refresh email/name/avatarUrl.
+   *  2. Nobody has that sub, but the email already exists on an account with no
+   *     googleSub → LINK: stamp the sub onto that account and sign them in. The
+   *     passwordHash is left untouched, so email/password keeps working too.
+   *  3. Email is free → create a fresh Google account.
+   *
+   * Only a *different, non-null* googleSub on that email is a real conflict.
    */
-  async upsertFromGoogle(p: {
-    sub: string;
-    email: string;
-    name: string;
-    avatarUrl?: string;
-  }): Promise<User> {
+  async upsertFromGoogle(p: GoogleIdentity): Promise<User> {
     const email = normalizeEmail(p.email);
+
+    const bySub = await this.prisma.user.findUnique({
+      where: { googleSub: p.sub },
+    });
+    if (bySub) return this.refreshGoogleProfile(bySub, p, email);
+
+    const byEmail = await this.prisma.user.findUnique({ where: { email } });
+    if (byEmail) return this.linkGoogleIdentity(byEmail, p, email);
+
     try {
-      return await this.prisma.user.upsert({
-        where: { googleSub: p.sub },
-        create: {
+      return await this.prisma.user.create({
+        data: {
           googleSub: p.sub,
           email,
           name: p.name,
           avatarUrl: p.avatarUrl ?? null,
-          // Google asserts the email is verified, so these accounts skip OTP.
-          emailVerifiedAt: new Date(),
-        },
-        update: {
-          email,
-          name: p.name,
-          // undefined = Google sent no picture — keep whatever we have.
-          avatarUrl: p.avatarUrl,
+          // Google asserting email_verified is the proof our OTP flow demands,
+          // so these accounts skip it. Never stamp a verification we don't have.
+          emailVerifiedAt: p.emailVerified ? new Date() : null,
         },
       });
     } catch (error) {
-      if (this.isPrismaError(error, 'P2002')) {
-        // The unique email already belongs to a row with a different googleSub.
-        throw new ConflictException(
-          `The email ${email} is already registered to a different RoamWarden account. Sign in with the Google account you originally used, or contact support.`,
+      if (!this.isPrismaError(error, 'P2002')) {
+        this.logger.error(
+          `Unexpected error creating user from Google sub ${p.sub}`,
+          error instanceof Error ? error.stack : String(error),
         );
+        throw error;
       }
-      this.logger.error(
-        `Unexpected error upserting user from Google sub ${p.sub}`,
-        error instanceof Error ? error.stack : String(error),
-      );
-      throw error;
+      // Race: a concurrent sign-in (or a registration) claimed this sub/email
+      // between our lookups and this insert. Read once more and resolve against
+      // whoever won, instead of 500ing on the unique constraint.
+      const winner = await this.findGoogleRaceWinner(p.sub, email);
+      if (!winner) {
+        this.logger.error(
+          `Google sign-in for sub ${p.sub} hit a unique-constraint violation, but neither the sub nor ${email} resolves to a row`,
+          error instanceof Error ? error.stack : String(error),
+        );
+        throw error;
+      }
+      return winner.googleSub === p.sub
+        ? this.refreshGoogleProfile(winner, p, email)
+        : this.linkGoogleIdentity(winner, p, email);
     }
   }
 
@@ -454,6 +473,114 @@ export class UsersService {
   }
 
   // ── internals ─────────────────────────────────────────────────────────
+
+  /** Existing Google account signing in again: refresh what Google now says. */
+  private async refreshGoogleProfile(
+    user: User,
+    p: GoogleIdentity,
+    email: string,
+  ): Promise<User> {
+    try {
+      return await this.prisma.user.update({
+        where: { id: user.id },
+        data: {
+          email,
+          name: p.name,
+          // undefined = Google sent no picture — keep whatever we have.
+          avatarUrl: p.avatarUrl,
+        },
+      });
+    } catch (error) {
+      if (this.isPrismaError(error, 'P2002')) {
+        // Google now reports an address that another RoamWarden row owns.
+        throw new ConflictException(googleEmailLinkedElsewhere(email));
+      }
+      this.logger.error(
+        `Unexpected error refreshing Google profile for user ${user.id}`,
+        error instanceof Error ? error.stack : String(error),
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * Attaches a Google identity to an account that already owns this email —
+   * normally one created with email + password.
+   *
+   * SECURITY: linking by email is only sound because Google has *verified* the
+   * address. `emailVerified` is the ID token's `email_verified` claim; without
+   * it, anyone able to mint a Google account carrying someone else's address
+   * could walk into that person's password account. So we fail closed: no
+   * claim, no link. A different non-null googleSub on the row is a genuine
+   * conflict and never silently overwritten.
+   */
+  private async linkGoogleIdentity(
+    existing: User,
+    p: GoogleIdentity,
+    email: string,
+  ): Promise<User> {
+    if (existing.googleSub && existing.googleSub !== p.sub) {
+      throw new ConflictException(googleEmailLinkedElsewhere(email));
+    }
+    if (!p.emailVerified) {
+      throw new UnauthorizedException(googleEmailNotVerified(email));
+    }
+
+    // PRE-HIJACKING DEFENCE. If this account never proved it owns the mailbox
+    // (emailVerifiedAt is null) then its password was set by someone who merely
+    // CLAIMED the address — the classic pre-hijacking setup, where an attacker
+    // registers a password account on a victim's email and waits. Google has now
+    // proven the mailbox belongs to whoever is signing in, so they are the owner
+    // and the unproven password must not survive the link: keeping it would hand
+    // the attacker a working credential on a freshly-verified account. A genuine
+    // user who simply never verified pays one password reset, which they can
+    // complete precisely because they do control the mailbox.
+    const wasProven = existing.emailVerifiedAt !== null;
+
+    try {
+      const linked = await this.prisma.user.update({
+        where: { id: existing.id },
+        data: {
+          googleSub: p.sub,
+          // Keep the name they chose at sign-up; only fill a blank avatar.
+          avatarUrl: existing.avatarUrl ?? p.avatarUrl ?? null,
+          // Google's verified assertion is the same proof our OTP flow demands.
+          emailVerifiedAt: existing.emailVerifiedAt ?? new Date(),
+          // Both methods keep working ONLY when the password was set on an
+          // already-verified account; otherwise it is revoked (see above).
+          ...(wasProven ? {} : { passwordHash: null }),
+        },
+      });
+      this.logger.log(
+        wasProven
+          ? `Linked Google sign-in to verified account ${existing.id}`
+          : `Linked Google sign-in to unverified account ${existing.id}; revoked its unproven password`,
+      );
+      return linked;
+    } catch (error) {
+      if (this.isPrismaError(error, 'P2002')) {
+        // Another request linked this sub to a different row first.
+        throw new ConflictException(googleEmailLinkedElsewhere(email));
+      }
+      this.logger.error(
+        `Unexpected error linking Google sub to existing user ${existing.id}`,
+        error instanceof Error ? error.stack : String(error),
+      );
+      throw error;
+    }
+  }
+
+  /** Single re-read after a P2002 race: whoever actually owns sub, else email. */
+  private async findGoogleRaceWinner(
+    sub: string,
+    email: string,
+  ): Promise<User | null> {
+    const bySub = await this.prisma.user.findUnique({
+      where: { googleSub: sub },
+    });
+    if (bySub) return bySub;
+    return this.prisma.user.findUnique({ where: { email } });
+  }
 
   /** Linked contact must be a real user and not the owner themselves. */
   private async assertLinkableContactUser(

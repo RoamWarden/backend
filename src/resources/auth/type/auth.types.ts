@@ -4,6 +4,12 @@ export interface GoogleProfile {
   email: string;
   name: string;
   avatarUrl?: string;
+  /**
+   * Google's `email_verified` claim, carried verbatim from the ID token.
+   * UsersService refuses to link this identity onto a pre-existing account
+   * unless it is true, so this must never be hardcoded.
+   */
+  emailVerified: boolean;
 }
 
 /** Public user summary returned alongside a fresh token pair. */

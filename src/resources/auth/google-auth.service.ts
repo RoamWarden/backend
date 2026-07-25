@@ -73,6 +73,9 @@ export class GoogleAuthService {
       email: payload.email,
       name: payload.name ?? payload.given_name ?? payload.email.split('@')[0],
       avatarUrl: payload.picture ?? undefined,
+      // Carried from the token, never assumed: UsersService re-checks this
+      // before linking the identity onto an existing password account.
+      emailVerified: payload.email_verified === true,
     };
   }
 }

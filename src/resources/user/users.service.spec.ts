@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   NotFoundException,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { DevicePlatform, Prisma } from '@prisma/client';
 import { Test, TestingModule } from '@nestjs/testing';
@@ -14,7 +15,10 @@ import {
   CONTACT_NEEDS_REACHABLE_FIELD,
   CONTACT_USER_SELECT,
   DUPLICATE_LINKED_CONTACT,
+  googleEmailLinkedElsewhere,
+  googleEmailNotVerified,
 } from './constant/users.constants';
+import type { GoogleIdentity } from './type/users.types';
 
 /** Build a real Prisma known-request error so `instanceof` checks match. */
 const prismaError = (code: string): Prisma.PrismaClientKnownRequestError =>
@@ -37,6 +41,7 @@ describe('UsersService', () => {
   let prismaMock: {
     user: {
       findUnique: jest.Mock;
+      create: jest.Mock;
       upsert: jest.Mock;
       update: jest.Mock;
       delete: jest.Mock;
@@ -61,6 +66,7 @@ describe('UsersService', () => {
     prismaMock = {
       user: {
         findUnique: jest.fn(),
+        create: jest.fn(),
         upsert: jest.fn(),
         update: jest.fn(),
         delete: jest.fn(),
@@ -232,23 +238,44 @@ describe('UsersService', () => {
   // ── upsertFromGoogle ─────────────────────────────────────────────────────
 
   describe('upsertFromGoogle', () => {
-    it('upserts keyed on googleSub and returns the user', async () => {
-      const user = { id: 'u1', email: 'a@b.com' };
-      prismaMock.user.upsert.mockResolvedValue(user);
+    /** A verified Google identity — the only kind our verifier hands over. */
+    const identity = (over: Partial<GoogleIdentity> = {}): GoogleIdentity => ({
+      sub: 'sub-123',
+      email: 'ada@b.com',
+      name: 'Ada',
+      emailVerified: true,
+      ...over,
+    });
 
-      const result = await service.upsertFromGoogle({
-        sub: 'sub-123',
-        email: 'A@B.com', // mixed case — must be stored lowercased
-        name: 'Ada',
-        avatarUrl: 'http://img/a.png',
+    /** Nobody owns the sub, nobody owns the email. */
+    const noExistingUser = () =>
+      prismaMock.user.findUnique
+        .mockResolvedValueOnce(null) // by googleSub
+        .mockResolvedValueOnce(null); // by email
+
+    it('creates a pre-verified account for a brand-new Google user', async () => {
+      const created = { id: 'u1', email: 'ada@b.com' };
+      noExistingUser();
+      prismaMock.user.create.mockResolvedValue(created);
+
+      const result = await service.upsertFromGoogle(
+        identity({
+          email: 'Ada@B.com', // mixed case — must be stored lowercased
+          avatarUrl: 'http://img/a.png',
+        }),
+      );
+
+      expect(result).toBe(created);
+      expect(prismaMock.user.findUnique).toHaveBeenNthCalledWith(1, {
+        where: { googleSub: 'sub-123' },
       });
-
-      expect(result).toBe(user);
-      const arg = firstArg<Prisma.UserUpsertArgs>(prismaMock.user.upsert);
-      expect(arg.where).toEqual({ googleSub: 'sub-123' });
-      expect(arg.create).toEqual({
+      expect(prismaMock.user.findUnique).toHaveBeenNthCalledWith(2, {
+        where: { email: 'ada@b.com' },
+      });
+      const arg = firstArg<Prisma.UserCreateArgs>(prismaMock.user.create);
+      expect(arg.data).toEqual({
         googleSub: 'sub-123',
-        email: 'a@b.com',
+        email: 'ada@b.com',
         name: 'Ada',
         avatarUrl: 'http://img/a.png',
         // Google asserts the email is verified, so the account is pre-verified.
@@ -257,42 +284,273 @@ describe('UsersService', () => {
     });
 
     it('coerces a missing avatarUrl to null on create', async () => {
-      prismaMock.user.upsert.mockResolvedValue({ id: 'u1' });
-      await service.upsertFromGoogle({
-        sub: 'sub-1',
-        email: 'a@b.com',
-        name: 'Ada',
-      });
-      const arg = firstArg<Prisma.UserUpsertArgs>(prismaMock.user.upsert);
-      expect(arg.create.avatarUrl).toBeNull();
+      noExistingUser();
+      prismaMock.user.create.mockResolvedValue({ id: 'u1' });
+
+      await service.upsertFromGoogle(identity());
+
+      const arg = firstArg<Prisma.UserCreateArgs>(prismaMock.user.create);
+      expect(arg.data.avatarUrl).toBeNull();
     });
 
-    it('maps a P2002 (email owned by another identity) to ConflictException', async () => {
-      prismaMock.user.upsert.mockRejectedValue(prismaError('P2002'));
-      await expect(
-        service.upsertFromGoogle({
-          sub: 'sub-1',
-          email: 'taken@b.com',
-          name: 'Ada',
-        }),
-      ).rejects.toBeInstanceOf(ConflictException);
-      await expect(
-        service.upsertFromGoogle({
-          sub: 'sub-1',
-          email: 'taken@b.com',
-          name: 'Ada',
-        }),
-      ).rejects.toThrow(
-        /The email taken@b.com is already registered to a different RoamWarden account/,
+    it('never pre-verifies a new account Google would not vouch for', async () => {
+      noExistingUser();
+      prismaMock.user.create.mockResolvedValue({ id: 'u1' });
+
+      await service.upsertFromGoogle(identity({ emailVerified: false }));
+
+      const arg = firstArg<Prisma.UserCreateArgs>(prismaMock.user.create);
+      expect(arg.data.emailVerifiedAt).toBeNull();
+    });
+
+    it('signs an existing Google user in and refreshes their profile', async () => {
+      const existing = { id: 'u1', googleSub: 'sub-123', email: 'old@b.com' };
+      const refreshed = { id: 'u1', googleSub: 'sub-123', email: 'ada@b.com' };
+      prismaMock.user.findUnique.mockResolvedValueOnce(existing);
+      prismaMock.user.update.mockResolvedValue(refreshed);
+
+      const result = await service.upsertFromGoogle(
+        identity({ email: 'Ada@B.com', name: 'Ada Lovelace' }),
       );
+
+      expect(result).toBe(refreshed);
+      // Matching sub short-circuits: no email lookup, no create.
+      expect(prismaMock.user.findUnique).toHaveBeenCalledTimes(1);
+      expect(prismaMock.user.create).not.toHaveBeenCalled();
+      const arg = firstArg<Prisma.UserUpdateArgs>(prismaMock.user.update);
+      expect(arg.where).toEqual({ id: 'u1' });
+      expect(arg.data).toEqual({
+        email: 'ada@b.com',
+        name: 'Ada Lovelace',
+        avatarUrl: undefined, // Google sent no picture — keep what we have.
+      });
     });
 
-    it('rethrows unexpected errors unchanged', async () => {
-      const boom = new Error('db exploded');
-      prismaMock.user.upsert.mockRejectedValue(boom);
+    // ── the reported bug: password account + Google sign-in ─────────────────
+
+    it('LINKS the Google identity onto an existing password account and keeps the password', async () => {
+      const passwordAccount = {
+        id: 'u1',
+        email: 'ada@b.com',
+        googleSub: null,
+        passwordHash: 'argon2-hash',
+        emailVerifiedAt: null,
+        avatarUrl: null,
+        name: 'Ada',
+      };
+      const linked = { ...passwordAccount, googleSub: 'sub-123' };
+      prismaMock.user.findUnique
+        .mockResolvedValueOnce(null) // no account owns this sub yet
+        .mockResolvedValueOnce(passwordAccount);
+      prismaMock.user.update.mockResolvedValue(linked);
+
+      const result = await service.upsertFromGoogle(
+        identity({ avatarUrl: 'http://img/a.png' }),
+      );
+
+      expect(result).toBe(linked);
+      expect(prismaMock.user.create).not.toHaveBeenCalled();
+      const arg = firstArg<Prisma.UserUpdateArgs>(prismaMock.user.update);
+      expect(arg.where).toEqual({ id: 'u1' });
+      expect(arg.data).toEqual({
+        googleSub: 'sub-123',
+        avatarUrl: 'http://img/a.png', // had none — fill it from Google
+        // Google's verified assertion stands in for the OTP they never entered.
+        emailVerifiedAt: ANY_DATE,
+        // PRE-HIJACKING DEFENCE: this account never proved it owned the mailbox
+        // (emailVerifiedAt was null), so its password was set by someone who only
+        // CLAIMED the address. Google has now proven who really owns it, so that
+        // unproven credential must NOT survive the link — otherwise an attacker
+        // who registered on the victim's email first would keep a working
+        // password on a freshly-verified account.
+        passwordHash: null,
+      });
+    });
+
+    it('KEEPS the password when linking to an account that had already verified its email', async () => {
+      const alreadyVerified = new Date('2026-07-01T00:00:00.000Z');
+      const verifiedAccount = {
+        id: 'u1',
+        email: 'ada@b.com',
+        googleSub: null,
+        passwordHash: 'argon2-hash',
+        emailVerifiedAt: alreadyVerified,
+        avatarUrl: null,
+        name: 'Ada',
+      };
+      prismaMock.user.findUnique
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(verifiedAccount);
+      prismaMock.user.update.mockResolvedValue({
+        ...verifiedAccount,
+        googleSub: 'sub-123',
+      });
+
+      await service.upsertFromGoogle(identity());
+
+      const arg = firstArg<Prisma.UserUpdateArgs>(prismaMock.user.update);
+      // This user completed the OTP flow, so they demonstrably control the
+      // mailbox: both sign-in methods are legitimately theirs and must keep
+      // working. Only an UNPROVEN password is revoked.
+      expect(arg.data).not.toHaveProperty('passwordHash');
+      expect(arg.data.emailVerifiedAt).toEqual(alreadyVerified);
+    });
+
+    it('keeps the account name, existing avatar and original verification date when linking', async () => {
+      const verifiedAt = new Date('2026-01-01T00:00:00.000Z');
+      prismaMock.user.findUnique
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({
+          id: 'u1',
+          email: 'ada@b.com',
+          googleSub: null,
+          passwordHash: 'argon2-hash',
+          emailVerifiedAt: verifiedAt,
+          avatarUrl: 'http://img/mine.png',
+          name: 'Ada from sign-up',
+        });
+      prismaMock.user.update.mockResolvedValue({ id: 'u1' });
+
+      await service.upsertFromGoogle(
+        identity({
+          name: 'Google Display Name',
+          avatarUrl: 'http://img/g.png',
+        }),
+      );
+
+      const arg = firstArg<Prisma.UserUpdateArgs>(prismaMock.user.update);
+      expect(arg.data).toEqual({
+        googleSub: 'sub-123',
+        avatarUrl: 'http://img/mine.png',
+        emailVerifiedAt: verifiedAt,
+      });
+      expect(arg.data).not.toHaveProperty('name');
+    });
+
+    it('REFUSES to link when Google has not verified the email (account takeover guard)', async () => {
+      const passwordAccount = {
+        id: 'u1',
+        email: 'victim@b.com',
+        googleSub: null,
+        passwordHash: 'argon2-hash',
+        emailVerifiedAt: null,
+        avatarUrl: null,
+      };
+      prismaMock.user.findUnique
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(passwordAccount);
+
       await expect(
-        service.upsertFromGoogle({ sub: 's', email: 'e', name: 'n' }),
-      ).rejects.toBe(boom);
+        service.upsertFromGoogle(
+          identity({ email: 'victim@b.com', emailVerified: false }),
+        ),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(prismaMock.user.update).not.toHaveBeenCalled();
+      expect(prismaMock.user.create).not.toHaveBeenCalled();
+    });
+
+    it('explains the unverified-email refusal in human terms', async () => {
+      prismaMock.user.findUnique
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ id: 'u1', googleSub: null });
+
+      await expect(
+        service.upsertFromGoogle(
+          identity({ email: 'victim@b.com', emailVerified: false }),
+        ),
+      ).rejects.toThrow(googleEmailNotVerified('victim@b.com'));
+    });
+
+    it('still conflicts when the email belongs to a DIFFERENT Google account', async () => {
+      prismaMock.user.findUnique
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ id: 'u1', googleSub: 'someone-else' });
+
+      await expect(
+        service.upsertFromGoogle(identity({ email: 'taken@b.com' })),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(prismaMock.user.update).not.toHaveBeenCalled();
+    });
+
+    it('gives the different-Google-account conflict a human message', async () => {
+      prismaMock.user.findUnique
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ id: 'u1', googleSub: 'someone-else' });
+
+      await expect(
+        service.upsertFromGoogle(identity({ email: 'taken@b.com' })),
+      ).rejects.toThrow(googleEmailLinkedElsewhere('taken@b.com'));
+    });
+
+    // ── concurrency ─────────────────────────────────────────────────────────
+
+    it('retries the lookup once when a concurrent request wins the create race, then links', async () => {
+      const passwordAccount = {
+        id: 'u1',
+        email: 'ada@b.com',
+        googleSub: null,
+        passwordHash: 'argon2-hash',
+        emailVerifiedAt: null,
+        avatarUrl: null,
+      };
+      const linked = { ...passwordAccount, googleSub: 'sub-123' };
+      prismaMock.user.findUnique
+        .mockResolvedValueOnce(null) // 1st pass: no sub
+        .mockResolvedValueOnce(null) // 1st pass: no email
+        .mockResolvedValueOnce(null) // retry: still no sub
+        .mockResolvedValueOnce(passwordAccount); // retry: the winner's row
+      prismaMock.user.create.mockRejectedValue(prismaError('P2002'));
+      prismaMock.user.update.mockResolvedValue(linked);
+
+      await expect(service.upsertFromGoogle(identity())).resolves.toBe(linked);
+
+      expect(prismaMock.user.create).toHaveBeenCalledTimes(1);
+      expect(prismaMock.user.findUnique).toHaveBeenCalledTimes(4);
+      const arg = firstArg<Prisma.UserUpdateArgs>(prismaMock.user.update);
+      expect(arg.data).toMatchObject({ googleSub: 'sub-123' });
+    });
+
+    it('returns the row a concurrent identical sign-in created (same sub wins the race)', async () => {
+      const winner = { id: 'u1', googleSub: 'sub-123', email: 'ada@b.com' };
+      prismaMock.user.findUnique
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(winner); // retry: the sub now exists
+      prismaMock.user.create.mockRejectedValue(prismaError('P2002'));
+      prismaMock.user.update.mockResolvedValue(winner);
+
+      await expect(service.upsertFromGoogle(identity())).resolves.toBe(winner);
+      const arg = firstArg<Prisma.UserUpdateArgs>(prismaMock.user.update);
+      expect(arg.where).toEqual({ id: 'u1' });
+    });
+
+    it('rethrows the P2002 when the retry finds no owner at all (no silent loop)', async () => {
+      const conflict = prismaError('P2002');
+      prismaMock.user.findUnique.mockResolvedValue(null);
+      prismaMock.user.create.mockRejectedValue(conflict);
+
+      await expect(service.upsertFromGoogle(identity())).rejects.toBe(conflict);
+      expect(prismaMock.user.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('rethrows unexpected create errors unchanged', async () => {
+      const boom = new Error('db exploded');
+      noExistingUser();
+      prismaMock.user.create.mockRejectedValue(boom);
+
+      await expect(service.upsertFromGoogle(identity())).rejects.toBe(boom);
+    });
+
+    it('maps a P2002 while refreshing an existing Google profile to a conflict', async () => {
+      prismaMock.user.findUnique.mockResolvedValueOnce({
+        id: 'u1',
+        googleSub: 'sub-123',
+      });
+      prismaMock.user.update.mockRejectedValue(prismaError('P2002'));
+
+      await expect(
+        service.upsertFromGoogle(identity({ email: 'taken@b.com' })),
+      ).rejects.toThrow(googleEmailLinkedElsewhere('taken@b.com'));
     });
   });
 

@@ -1,6 +1,23 @@
 import type { Prisma, User } from '@prisma/client';
 import type { CONTACT_USER_SELECT } from '../constant/users.constants';
 
+/**
+ * Verified Google identity handed to {@link UsersService.upsertFromGoogle}.
+ * Structurally identical to the auth module's `GoogleProfile` so the controller
+ * can pass one straight through, without the user module importing from auth.
+ */
+export interface GoogleIdentity {
+  sub: string;
+  email: string;
+  name: string;
+  avatarUrl?: string;
+  /**
+   * Google's `email_verified` claim. Linking a Google identity onto an account
+   * that already exists is only safe when this is true — see upsertFromGoogle.
+   */
+  emailVerified: boolean;
+}
+
 /** Trusted contact plus the safe subset of its linked user's profile. */
 export type ContactWithLinkedUser = Prisma.TrustedContactGetPayload<{
   include: typeof CONTACT_USER_SELECT;

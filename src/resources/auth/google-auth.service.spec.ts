@@ -106,6 +106,8 @@ describe('GoogleAuthService', () => {
         email: 'jane@example.com',
         name: 'Jane Traveller',
         avatarUrl: 'https://cdn.example.com/jane.png',
+        // Carried through so UsersService can gate account linking on it.
+        emailVerified: true,
       });
     });
 
