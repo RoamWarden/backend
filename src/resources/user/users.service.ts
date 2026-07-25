@@ -15,17 +15,31 @@ import type { CreateContactDto } from './dto/create-contact.dto';
 import type { RegisterDeviceDto } from './dto/register-device.dto';
 import type { UpdateContactDto } from './dto/update-contact.dto';
 import type { UpdateProfileDto } from './dto/update-profile.dto';
+import { ThrottlerException } from '@nestjs/throttler';
 import {
+  CONTACT_LOOKUP_MAX_PER_WINDOW,
+  CONTACT_LOOKUP_NO_ACCOUNT,
+  CONTACT_LOOKUP_RATE_LIMITED,
+  CONTACT_LOOKUP_SELECT,
+  CONTACT_LOOKUP_SELF,
+  CONTACT_LOOKUP_SELF_CODE,
+  CONTACT_LOOKUP_WINDOW_S,
   CONTACT_NEEDS_REACHABLE_FIELD,
   CONTACT_NOT_FOUND,
+  CONTACT_SELF_LINK,
   CONTACT_USER_SELECT,
   DUPLICATE_LINKED_CONTACT,
   GOOGLE_NO_ACCOUNT_CODE,
+  LINKED_USER_NOT_FOUND,
+  contactLookupAlreadyAdded,
+  contactLookupFound,
+  contactLookupQuotaKey,
   googleEmailLinkedElsewhere,
   googleEmailNotVerified,
   googleNoAccount,
 } from './constant/users.constants';
 import type {
+  ContactUserLookupResult,
   ContactWithLinkedUser,
   GoogleIdentity,
   GoogleUpsertOptions,
@@ -344,6 +358,86 @@ export class UsersService {
     });
   }
 
+  /**
+   * Resolves an EXACT email to the minimal public profile of a RoamWarden
+   * account, so the app can link a trusted contact without a human ever pasting
+   * a user id.
+   *
+   * This is an account-enumeration surface and is built as one:
+   *
+   *  - EXACT match only. `findUnique` on the normalised address — no prefix, no
+   *    `contains`, no fuzzy fallback. You can confirm an address you already
+   *    know; you can never browse for one.
+   *  - Rate limited per ACCOUNT here (see {@link assertWithinLookupQuota}) and
+   *    per IP by `@Throttle` on the route.
+   *  - Returns id + name + avatar and nothing else, assembled field by field so
+   *    a future widening of the select cannot leak through.
+   *  - Answers "no account" as a normal 200 with a next step, so a miss is not
+   *    dressed up as an error the app has to apologise for.
+   *
+   * CONFIRMING EXISTENCE IS THE DELIBERATE CHOICE. Secrecy is not what protects
+   * this data: mutual consent is. Learning that ada@example.com has an account
+   * grants exactly nothing — linking her does not show the caller her location,
+   * nor hers to him, until she independently adds him back (see
+   * {@link filterConsentingContactUserIds}, which every fan-out passes through).
+   * The alternative — link blind to an address and hope — would be worse UX for
+   * a safety feature and no safer, because the identical email/no-email signal
+   * leaks anyway the moment alerts do or don't arrive.
+   */
+  async lookupContactUserByEmail(
+    userId: string,
+    email: string,
+  ): Promise<ContactUserLookupResult> {
+    // Counted BEFORE the query, so misses and self-lookups — exactly what a
+    // scraper generates — spend budget too.
+    await this.assertWithinLookupQuota(userId);
+
+    const match = await this.prisma.user.findUnique({
+      where: { email: normalizeEmail(email) },
+      select: CONTACT_LOOKUP_SELECT,
+    });
+
+    if (!match) {
+      // Deliberately no email in this log line: an audit trail of who searched
+      // for whom would be a worse privacy leak than the endpoint itself.
+      this.logger.log(`Contact lookup by user ${userId}: no match`);
+      return {
+        found: false,
+        user: null,
+        alreadyAdded: false,
+        existingContactId: null,
+        message: CONTACT_LOOKUP_NO_ACCOUNT,
+      };
+    }
+
+    if (match.id === userId) {
+      throw new BadRequestException({
+        code: CONTACT_LOOKUP_SELF_CODE,
+        message: CONTACT_LOOKUP_SELF,
+      });
+    }
+
+    // The caller's OWN row, so this discloses nothing about the matched user —
+    // and it stops the app collecting a name and a relation only to be told 409.
+    const existing = await this.prisma.trustedContact.findUnique({
+      where: { userId_contactUserId: { userId, contactUserId: match.id } },
+      select: { id: true },
+    });
+
+    this.logger.log(`Contact lookup by user ${userId}: matched ${match.id}`);
+    return {
+      found: true,
+      // Copied field by field on purpose — never spread a database row into a
+      // response about someone who is not the caller.
+      user: { id: match.id, name: match.name, avatarUrl: match.avatarUrl },
+      alreadyAdded: existing !== null,
+      existingContactId: existing?.id ?? null,
+      message: existing
+        ? contactLookupAlreadyAdded(match.name)
+        : contactLookupFound(match.name),
+    };
+  }
+
   async createContact(
     userId: string,
     dto: CreateContactDto,
@@ -382,9 +476,7 @@ export class UsersService {
       }
       // Race against the linked user deleting their account.
       if (this.isPrismaError(error, 'P2003')) {
-        throw new NotFoundException(
-          `No RoamWarden user exists with id ${dto.contactUserId}. Double-check the id, or omit contactUserId to save an unlinked contact.`,
-        );
+        throw new NotFoundException(LINKED_USER_NOT_FOUND);
       }
       this.logger.error(
         `Unexpected error creating trusted contact for user ${userId}`,
@@ -456,6 +548,11 @@ export class UsersService {
       }
       if (this.isPrismaError(error, 'P2025')) {
         throw new NotFoundException(CONTACT_NOT_FOUND);
+      }
+      // Race: the account being linked deleted itself between the check above
+      // and this write. Without this the user got a bare 500.
+      if (this.isPrismaError(error, 'P2003')) {
+        throw new NotFoundException(LINKED_USER_NOT_FOUND);
       }
       this.logger.error(
         `Unexpected error updating trusted contact ${contactId} for user ${userId}`,
@@ -612,24 +709,46 @@ export class UsersService {
     return this.prisma.user.findUnique({ where: { email } });
   }
 
+  /**
+   * Per-ACCOUNT lookup budget, fixed window in Redis.
+   *
+   * The route's `@Throttle` only sees an IP, because the global ThrottlerGuard
+   * is registered ahead of JwtAuthGuard and therefore runs before `req.user`
+   * exists. That leaves rotating IPs as a free bypass, which is precisely how a
+   * breached-email-list replay would be run — so the identity-aware half of the
+   * limit lives here, where the caller is known.
+   *
+   * Fails OPEN when Redis is down (`incrementCounter` returns null), matching
+   * the OTP send quota: a Redis blip must not stop people adding the contacts
+   * that make the SOS features work, and the per-IP limit still applies.
+   */
+  private async assertWithinLookupQuota(userId: string): Promise<void> {
+    const count = await this.redis.incrementCounter(
+      contactLookupQuotaKey(userId),
+      CONTACT_LOOKUP_WINDOW_S,
+    );
+    if (count !== null && count > CONTACT_LOOKUP_MAX_PER_WINDOW) {
+      this.logger.warn(
+        `User ${userId} exceeded the contact-lookup budget (${count} lookups in ${CONTACT_LOOKUP_WINDOW_S}s)`,
+      );
+      throw new ThrottlerException(CONTACT_LOOKUP_RATE_LIMITED);
+    }
+  }
+
   /** Linked contact must be a real user and not the owner themselves. */
   private async assertLinkableContactUser(
     userId: string,
     contactUserId: string,
   ): Promise<void> {
     if (contactUserId === userId) {
-      throw new BadRequestException(
-        "You can't add yourself as your own trusted contact. Link a different RoamWarden user, or omit contactUserId.",
-      );
+      throw new BadRequestException(CONTACT_SELF_LINK);
     }
     const linked = await this.prisma.user.findUnique({
       where: { id: contactUserId },
       select: { id: true },
     });
     if (!linked) {
-      throw new NotFoundException(
-        `No RoamWarden user exists with id ${contactUserId}. Double-check the id, or omit contactUserId to save an unlinked contact.`,
-      );
+      throw new NotFoundException(LINKED_USER_NOT_FOUND);
     }
   }
 

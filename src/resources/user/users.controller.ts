@@ -11,14 +11,18 @@ import {
   Patch,
   Post,
 } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../../common/types/auth.types';
+import { CONTACT_LOOKUP_THROTTLE } from './constant/users.constants';
 import { CreateContactDto } from './dto/create-contact.dto';
+import { LookupContactUserDto } from './dto/lookup-contact-user.dto';
 import { RegisterDeviceDto } from './dto/register-device.dto';
 import { UpdateContactDto } from './dto/update-contact.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { UsersService } from './users.service';
 import type {
+  ContactUserLookupResult,
   ContactWithLinkedUser,
   ProfileWithCounts,
   UserProfile,
@@ -27,7 +31,7 @@ import type {
 const contactIdPipe = new ParseUUIDPipe({
   exceptionFactory: () =>
     new BadRequestException(
-      'Contact id must be a valid UUID — copy it from GET /me/contacts.',
+      "We couldn't read that contact — reopen your trusted contacts and try again.",
     ),
 });
 
@@ -66,6 +70,31 @@ export class UsersController {
     @CurrentUser() user: AuthenticatedUser,
   ): Promise<ContactWithLinkedUser[]> {
     return this.usersService.listContacts(user.id);
+  }
+
+  /**
+   * Find a RoamWarden account by EXACT email, so linking a trusted contact
+   * never requires anyone to read a uuid down the phone.
+   *
+   * POST, not GET, on purpose: the address stays in a request body instead of a
+   * URL that proxies, access logs and browser history would keep forever, and
+   * nothing can cache the answer. `@HttpCode(200)` because this creates
+   * nothing — and a miss is a 200 too (`found: false` + a next step), never a
+   * 404 the UI has to present as a failure.
+   *
+   * Throttled far tighter than the global default; see
+   * {@link CONTACT_LOOKUP_THROTTLE}. This decorator is the per-IP half — the
+   * per-account half is enforced inside the service, because the global
+   * ThrottlerGuard runs before the JWT guard and so cannot see who is asking.
+   */
+  @Throttle({ default: CONTACT_LOOKUP_THROTTLE })
+  @Post('contacts/lookup')
+  @HttpCode(HttpStatus.OK)
+  lookupContactUser(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: LookupContactUserDto,
+  ): Promise<ContactUserLookupResult> {
+    return this.usersService.lookupContactUserByEmail(user.id, dto.email);
   }
 
   @Post('contacts')

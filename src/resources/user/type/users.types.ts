@@ -54,3 +54,45 @@ export type UserProfile = Pick<
 export interface ProfileWithCounts extends UserProfile {
   counts: { trips: number; reports: number; contacts: number };
 }
+
+/**
+ * The only shape of another person's account this API ever hands out.
+ * Deliberately the same three fields the contact list already exposes for a
+ * linked user (`CONTACT_USER_SELECT`): enough to recognise a face and a name,
+ * nothing that could be harvested.
+ */
+export interface PublicContactUser {
+  id: string;
+  name: string;
+  avatarUrl: string | null;
+}
+
+/**
+ * Result of POST /me/contacts/lookup. Both arms are HTTP 200 — "there is no
+ * account with that email" is an ordinary answer, not a failure — and both
+ * carry a `message` the app can show verbatim.
+ *
+ * `alreadyAdded` / `existingContactId` describe the CALLER's own contact list,
+ * never the matched user's, so they leak nothing about the other person. In
+ * particular this never says whether they have added the caller back: that
+ * reciprocity is their private business, and the mutual-consent gate in
+ * {@link UsersService.filterConsentingContactUserIds} enforces it server-side
+ * regardless of what the client knows.
+ */
+export type ContactUserLookupResult =
+  | {
+      found: true;
+      user: PublicContactUser;
+      /** True when this account is already one of the caller's contacts. */
+      alreadyAdded: boolean;
+      /** Id of that existing TrustedContact row, so the app can open it. */
+      existingContactId: string | null;
+      message: string;
+    }
+  | {
+      found: false;
+      user: null;
+      alreadyAdded: false;
+      existingContactId: null;
+      message: string;
+    };

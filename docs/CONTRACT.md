@@ -153,13 +153,121 @@ class UsersService {
   getTrustedContacts(userId: string): Promise<TrustedContact[]>;
   /** userIds of contacts that are linked app users (contactUserId != null) */
   getContactUserIds(userId: string): Promise<string[]>;
+  /** Exact-email → minimal public profile. See "Contact lookup by email". */
+  lookupContactUserByEmail(
+    userId: string,
+    email: string,
+  ): Promise<ContactUserLookupResult>;
 }
 ```
 
 REST: `GET /me` (profile + reputation), `PATCH /me { name?, phone?, avatarUrl? }`,
 `DELETE /me` (full cascade delete — GDPR), `GET/POST/PATCH/DELETE /me/contacts(/:id)`,
-`POST /me/devices { token, platform: 'IOS'|'ANDROID' }`, `DELETE /me/devices/:token`.
+`POST /me/contacts/lookup`, `POST /me/devices { token, platform: 'IOS'|'ANDROID' }`,
+`DELETE /me/devices/:token`.
 Contact create body: `{ name, phone?, email?, contactUserId?, relation? }`.
+
+A trusted contact is either DETAILS-ONLY (name + phone/email you keep so you can
+reach them yourself — RoamWarden sends them nothing) or LINKED (`contactUserId`
+set), which is what enables in-app trip + SOS alerts. `contactUserId` must come
+from the lookup below; users never type or paste it.
+
+#### Contact lookup by email — `POST /me/contacts/lookup`
+
+Authenticated (Bearer, like the rest of `/me`). Resolves ONE exact email to the
+minimal public profile of a RoamWarden account so the app can link a trusted
+contact without anyone reading a uuid down the phone.
+
+Request body — exactly one field; any other property is a 400
+(`whitelist + forbidNonWhitelisted`), so this can never grow into a directory
+search:
+
+```jsonc
+{ "email": "ada@example.com" }   // trimmed + lowercased server-side
+```
+
+Success — **always 200**, in two shapes discriminated by `found`:
+
+```jsonc
+// hit
+{
+  "found": true,
+  "user": { "id": "uuid", "name": "Ada Lovelace", "avatarUrl": "https://… | null" },
+  "alreadyAdded": false,          // already in the CALLER's contact list?
+  "existingContactId": null,      // that TrustedContact.id when alreadyAdded
+  "message": "Ada Lovelace is on RoamWarden. Linking them means they get your trip and SOS alerts in the app."
+}
+
+// miss — a normal outcome, NOT an error
+{
+  "found": false,
+  "user": null,
+  "alreadyAdded": false,
+  "existingContactId": null,
+  "message": "No RoamWarden account uses that email — you can still save them as a contact you'll reach yourself."
+}
+```
+
+```ts
+type ContactUserLookupResult =
+  | {
+      found: true;
+      user: { id: string; name: string; avatarUrl: string | null };
+      alreadyAdded: boolean;
+      existingContactId: string | null;
+      message: string;
+    }
+  | {
+      found: false;
+      user: null;
+      alreadyAdded: false;
+      existingContactId: null;
+      message: string;
+    };
+```
+
+`user` is **only** those three fields. Never the email back, never phone,
+reputation, counts, trips or contacts. `alreadyAdded` / `existingContactId`
+describe the caller's own rows, so they disclose nothing about the other
+account — and in particular the response NEVER says whether that person has
+added the caller back.
+
+Failures (`message` is always human and safe to show verbatim):
+
+| Status | Body | When |
+| --- | --- | --- |
+| 400 | `{ statusCode, message: string[], error: 'Bad Request' }` | Not an email / missing / >320 chars / extra property. `message` is class-validator's array — join it. |
+| 400 | `{ code: 'SELF_LOOKUP', message: "That's your own account. Search for the email of the person you want to add as a trusted contact." }` | The email is the caller's. Branch on `code`, never the sentence. |
+| 401 | `{ statusCode, message: 'You must be signed in to do this.' }` | Missing/expired access token. |
+| 429 | `{ statusCode: 429, message }` | Rate limited — see below. |
+
+**Rate limit — 20 lookups per hour, enforced twice.** `@Throttle` on the route
+caps it per IP; `UsersService` additionally caps it per ACCOUNT in Redis,
+because the global `ThrottlerGuard` is registered ahead of `JwtAuthGuard` and so
+runs before `request.user` exists (rotating IPs would otherwise be a free
+bypass). The per-account 429 carries a human message
+(*"You've searched for a lot of people in a short time…"*); the per-IP 429 comes
+from the framework and carries `"ThrottlerException: Too Many Requests"`, so on
+**any** 429 from this route the app should show its own copy rather than echoing
+`message` blindly. The per-account limit fails OPEN if Redis is unreachable (the
+per-IP limit still applies).
+
+Then create the contact normally:
+`POST /me/contacts { name, contactUserId: <user.id from the lookup>, relation? }`.
+A `contactUserId` that is not a uuid → 400; that is the caller's own id → 400
+`"You can't add yourself as your own trusted contact. Search for the email of the
+person you want to add."`; that matches no account (stale lookup, account deleted
+mid-flow) → 404 `"That RoamWarden account no longer exists — it may have been
+deleted. Search for the person by email again, or save them as a contact you'll
+reach yourself."`; already linked → 409 `DUPLICATE_LINKED_CONTACT` (avoidable by
+checking `alreadyAdded` first).
+
+Linking is ONE-SIDED and grants nothing on its own: every notification fan-out
+passes through `UsersService.filterConsentingContactUserIds`, so neither party
+sees the other's live location until both have added each other. Confirming that
+an address has an account is therefore an acceptable disclosure at this exact,
+authenticated, rate-limited granularity — consent, not secrecy, is what protects
+the data.
 
 ### TripsModule (exports: `TripsService`)
 
@@ -562,6 +670,11 @@ Nest defaults (`{ statusCode, message, error }`). `message` must tell a human
 what happened and what to do. 401 invalid/expired token; 403 not yours; 404
 missing; 409 conflicting state (e.g. second active trip); 422 domain rejection
 (geo-implausible report); 429 throttled.
+
+Two responses carry a machine-readable `code` next to `message`, so clients
+branch on the code and never on the sentence: the 404 `{ code: 'NO_ACCOUNT' }`
+from login-only Google sign-in, and the 400 `{ code: 'SELF_LOOKUP' }` from
+`POST /me/contacts/lookup`.
 
 One 403 carries extra fields: a plan limit blocked by `EntitlementsService`
 adds `code` (`'PLAN_LIMIT_REACHED'` | `'PLAN_UPGRADE_REQUIRED'`), `planCode`,

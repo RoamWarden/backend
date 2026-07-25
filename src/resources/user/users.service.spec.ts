@@ -1,9 +1,11 @@
 import {
   BadRequestException,
   ConflictException,
+  HttpStatus,
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
+import { ThrottlerException } from '@nestjs/throttler';
 import { DevicePlatform, Prisma } from '@prisma/client';
 import { Test, TestingModule } from '@nestjs/testing';
 import { UsersService } from './users.service';
@@ -12,10 +14,21 @@ import { RedisService } from '../../providers/redis/redis.service';
 import type { CreateContactDto } from './dto/create-contact.dto';
 import type { RegisterDeviceDto } from './dto/register-device.dto';
 import {
+  CONTACT_LOOKUP_MAX_PER_WINDOW,
+  CONTACT_LOOKUP_NO_ACCOUNT,
+  CONTACT_LOOKUP_RATE_LIMITED,
+  CONTACT_LOOKUP_SELECT,
+  CONTACT_LOOKUP_SELF,
+  CONTACT_LOOKUP_SELF_CODE,
+  CONTACT_LOOKUP_WINDOW_S,
   CONTACT_NEEDS_REACHABLE_FIELD,
   CONTACT_USER_SELECT,
   DUPLICATE_LINKED_CONTACT,
   GOOGLE_NO_ACCOUNT_CODE,
+  LINKED_USER_NOT_FOUND,
+  contactLookupAlreadyAdded,
+  contactLookupFound,
+  contactLookupQuotaKey,
   googleEmailLinkedElsewhere,
   googleEmailNotVerified,
   googleNoAccount,
@@ -62,7 +75,7 @@ describe('UsersService', () => {
     };
     $transaction: jest.Mock;
   };
-  let redisMock: { clearPresence: jest.Mock };
+  let redisMock: { clearPresence: jest.Mock; incrementCounter: jest.Mock };
 
   beforeEach(async () => {
     prismaMock = {
@@ -88,7 +101,11 @@ describe('UsersService', () => {
       // Runs the callback against the same mock so tx-based code paths work.
       $transaction: jest.fn((cb: (tx: unknown) => unknown) => cb(prismaMock)),
     };
-    redisMock = { clearPresence: jest.fn().mockResolvedValue(undefined) };
+    redisMock = {
+      clearPresence: jest.fn().mockResolvedValue(undefined),
+      // Default: first lookup of the window, i.e. well within the budget.
+      incrementCounter: jest.fn().mockResolvedValue(1),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -101,10 +118,11 @@ describe('UsersService', () => {
     service = module.get(UsersService);
     // Silence the service logger so error-path tests don't spam the output.
     const { logger } = service as unknown as {
-      logger: { error: jest.Mock; log: jest.Mock };
+      logger: { error: jest.Mock; log: jest.Mock; warn: jest.Mock };
     };
     jest.spyOn(logger, 'error').mockImplementation(() => undefined);
     jest.spyOn(logger, 'log').mockImplementation(() => undefined);
+    jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
   });
 
   // ── findById ────────────────────────────────────────────────────────────
@@ -732,6 +750,204 @@ describe('UsersService', () => {
     });
   });
 
+  // ── lookupContactUserByEmail (account-enumeration surface) ───────────────
+
+  describe('lookupContactUserByEmail', () => {
+    /** A row as prisma returns it for CONTACT_LOOKUP_SELECT. */
+    const friend = { id: 'friend', name: 'Ada Lovelace', avatarUrl: null };
+
+    it('resolves an EXACT normalised email to the minimal public profile', async () => {
+      prismaMock.user.findUnique.mockResolvedValue(friend);
+      prismaMock.trustedContact.findUnique.mockResolvedValue(null);
+
+      const result = await service.lookupContactUserByEmail(
+        'u1',
+        'ada@example.com',
+      );
+
+      expect(result).toEqual({
+        found: true,
+        user: { id: 'friend', name: 'Ada Lovelace', avatarUrl: null },
+        alreadyAdded: false,
+        existingContactId: null,
+        message: contactLookupFound('Ada Lovelace'),
+      });
+      // findUnique on the unique column — never a `contains`/`startsWith` query.
+      expect(prismaMock.user.findUnique).toHaveBeenCalledWith({
+        where: { email: 'ada@example.com' },
+        select: CONTACT_LOOKUP_SELECT,
+      });
+    });
+
+    it('matches regardless of case and surrounding whitespace', async () => {
+      prismaMock.user.findUnique.mockResolvedValue(friend);
+      prismaMock.trustedContact.findUnique.mockResolvedValue(null);
+
+      await service.lookupContactUserByEmail('u1', '  AdA@Example.COM  ');
+
+      expect(prismaMock.user.findUnique).toHaveBeenCalledWith({
+        where: { email: 'ada@example.com' },
+        select: CONTACT_LOOKUP_SELECT,
+      });
+    });
+
+    it('selects ONLY id, name and avatarUrl — the enumeration budget of this endpoint', () => {
+      expect(Object.keys(CONTACT_LOOKUP_SELECT)).toEqual([
+        'id',
+        'name',
+        'avatarUrl',
+      ]);
+    });
+
+    it('never leaks email, phone, reputation or counts, even if the row carries them', async () => {
+      prismaMock.user.findUnique.mockResolvedValue({
+        ...friend,
+        email: 'ada@example.com',
+        phone: '+15551234567',
+        reputation: 42,
+        passwordHash: 'hash',
+        googleSub: 'sub-123',
+      });
+      prismaMock.trustedContact.findUnique.mockResolvedValue(null);
+
+      const result = await service.lookupContactUserByEmail(
+        'u1',
+        'ada@example.com',
+      );
+
+      expect(result.user).not.toBeNull();
+      expect(Object.keys(result.user ?? {})).toEqual([
+        'id',
+        'name',
+        'avatarUrl',
+      ]);
+      const body = JSON.stringify(result);
+      expect(body).not.toContain('ada@example.com');
+      expect(body).not.toContain('+15551234567');
+      expect(body).not.toContain('reputation');
+      expect(body).not.toContain('hash');
+      expect(body).not.toContain('sub-123');
+    });
+
+    it('treats "no account with that email" as a normal 200 outcome with a next step', async () => {
+      prismaMock.user.findUnique.mockResolvedValue(null);
+
+      const result = await service.lookupContactUserByEmail(
+        'u1',
+        'nobody@example.com',
+      );
+
+      expect(result).toEqual({
+        found: false,
+        user: null,
+        alreadyAdded: false,
+        existingContactId: null,
+        message: CONTACT_LOOKUP_NO_ACCOUNT,
+      });
+      expect(result.message).toMatch(/you can still save them as a contact/i);
+      // A miss must not cost a second query about the caller's contacts.
+      expect(prismaMock.trustedContact.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('refuses a self-lookup with a clear message and a branchable code', async () => {
+      prismaMock.user.findUnique.mockResolvedValue({
+        id: 'u1',
+        name: 'Me',
+        avatarUrl: null,
+      });
+
+      const error: unknown = await service
+        .lookupContactUserByEmail('u1', 'me@example.com')
+        .catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(BadRequestException);
+      expect((error as BadRequestException).getResponse()).toEqual({
+        code: CONTACT_LOOKUP_SELF_CODE,
+        message: CONTACT_LOOKUP_SELF,
+      });
+      expect(CONTACT_LOOKUP_SELF).toMatch(/your own account/i);
+      expect(prismaMock.trustedContact.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('reports when the match is already a contact, so the app never dead-ends on a 409', async () => {
+      prismaMock.user.findUnique.mockResolvedValue(friend);
+      prismaMock.trustedContact.findUnique.mockResolvedValue({ id: 'c9' });
+
+      const result = await service.lookupContactUserByEmail(
+        'u1',
+        'ada@example.com',
+      );
+
+      expect(result).toEqual({
+        found: true,
+        user: friend,
+        alreadyAdded: true,
+        existingContactId: 'c9',
+        message: contactLookupAlreadyAdded('Ada Lovelace'),
+      });
+      expect(prismaMock.trustedContact.findUnique).toHaveBeenCalledWith({
+        where: {
+          userId_contactUserId: { userId: 'u1', contactUserId: 'friend' },
+        },
+        select: { id: true },
+      });
+    });
+
+    // ── per-account rate limit ────────────────────────────────────────────
+
+    it('counts every lookup against a per-account window BEFORE querying', async () => {
+      prismaMock.user.findUnique.mockResolvedValue(null);
+
+      await service.lookupContactUserByEmail('u1', 'nobody@example.com');
+
+      expect(redisMock.incrementCounter).toHaveBeenCalledWith(
+        contactLookupQuotaKey('u1'),
+        CONTACT_LOOKUP_WINDOW_S,
+      );
+    });
+
+    it('allows the last lookup inside the budget', async () => {
+      redisMock.incrementCounter.mockResolvedValue(
+        CONTACT_LOOKUP_MAX_PER_WINDOW,
+      );
+      prismaMock.user.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.lookupContactUserByEmail('u1', 'nobody@example.com'),
+      ).resolves.toMatchObject({ found: false });
+    });
+
+    it('throws 429 with a human message once the budget is spent, without touching the database', async () => {
+      redisMock.incrementCounter.mockResolvedValue(
+        CONTACT_LOOKUP_MAX_PER_WINDOW + 1,
+      );
+
+      const error: unknown = await service
+        .lookupContactUserByEmail('u1', 'ada@example.com')
+        .catch((e: unknown) => e);
+
+      expect(error).toBeInstanceOf(ThrottlerException);
+      expect((error as ThrottlerException).getStatus()).toBe(
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+      expect((error as ThrottlerException).message).toBe(
+        CONTACT_LOOKUP_RATE_LIMITED,
+      );
+      // No oracle for the attacker: the query never runs.
+      expect(prismaMock.user.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('fails open when Redis is unavailable (per-IP throttle still applies)', async () => {
+      redisMock.incrementCounter.mockResolvedValue(null);
+      prismaMock.user.findUnique.mockResolvedValue(friend);
+      prismaMock.trustedContact.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.lookupContactUserByEmail('u1', 'ada@example.com'),
+      ).resolves.toMatchObject({ found: true });
+    });
+  });
+
   // ── createContact ────────────────────────────────────────────────────────
 
   describe('createContact', () => {
@@ -757,14 +973,18 @@ describe('UsersService', () => {
       expect(prismaMock.trustedContact.create).not.toHaveBeenCalled();
     });
 
-    it('rejects an unknown contactUserId with 404', async () => {
+    it('rejects an unknown contactUserId with 404 and a human message', async () => {
       prismaMock.user.findUnique.mockResolvedValue(null);
       const dto: CreateContactDto = { name: 'Ghost', contactUserId: 'nope' };
       await expect(service.createContact('u1', dto)).rejects.toBeInstanceOf(
         NotFoundException,
       );
       await expect(service.createContact('u1', dto)).rejects.toThrow(
-        /No RoamWarden user exists with id nope/,
+        LINKED_USER_NOT_FOUND,
+      );
+      // The raw id is never quoted back at the user.
+      await expect(service.createContact('u1', dto)).rejects.not.toThrow(
+        /nope/,
       );
       expect(prismaMock.trustedContact.create).not.toHaveBeenCalled();
     });
