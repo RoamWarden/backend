@@ -126,8 +126,9 @@ export class EnvironmentVariables {
   @IsString()
   MAIL_FROM?: string;
 
-  // Base URL of the web app that hosts the password-reset page (the reset link
-  // points here with ?token=…). Falls back to API_BASE_URL.
+  // Base URL of the website. Hosts the password-reset page (the reset link points
+  // here with ?token=…) and the subscription account area the app hands users off
+  // to (`/account?handoff=…` — see BillingService). Falls back to API_BASE_URL.
   @IsOptional()
   @IsString()
   WEB_APP_URL?: string;

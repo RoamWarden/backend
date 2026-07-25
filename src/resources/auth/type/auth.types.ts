@@ -36,3 +36,13 @@ export interface PendingVerification {
   verificationRequired: true;
   email: string;
 }
+
+/**
+ * A freshly minted app→web hand-off token. The raw token is returned exactly
+ * once (only its keyed hash is stored); callers embed it in the account URL and
+ * must never log it.
+ */
+export interface HandoffToken {
+  token: string;
+  expiresAt: Date;
+}

@@ -7,6 +7,7 @@ import { UsersService } from '../user/users.service';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { GoogleAuthDto } from './dto/google-auth.dto';
+import { HandoffDto } from './dto/handoff.dto';
 import { LoginDto } from './dto/login.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
@@ -15,6 +16,7 @@ import { ResetPasswordDto } from './dto/reset-password.dto';
 import { VerifyEmailDto } from './dto/verify-email.dto';
 import { EmailVerificationService } from './email-verification.service';
 import { GoogleAuthService } from './google-auth.service';
+import { HandoffTokenService } from './handoff-token.service';
 import { PasswordAuthService } from './password-auth.service';
 import { TokensService } from './tokens.service';
 import type {
@@ -31,6 +33,7 @@ export class AuthController {
     private readonly usersService: UsersService,
     private readonly passwordAuthService: PasswordAuthService,
     private readonly emailVerificationService: EmailVerificationService,
+    private readonly handoffTokenService: HandoffTokenService,
   ) {}
 
   @Public()
@@ -58,6 +61,20 @@ export class AuthController {
   @HttpCode(HttpStatus.NO_CONTENT)
   async logout(@Body() dto: RefreshTokenDto): Promise<void> {
     await this.tokensService.revokeRefreshToken(dto.refreshToken);
+  }
+
+  /**
+   * App → web account hand-off (build plan §20). The web account page swaps the
+   * single-use token from its URL for a normal session, exactly like login. The
+   * token is burned on redemption, so a leaked URL can't be replayed. Public by
+   * necessity — the browser has no session yet — and throttled like /auth/refresh.
+   */
+  @Public()
+  @Throttle({ default: { limit: 20, ttl: 900000 } })
+  @Post('handoff')
+  @HttpCode(HttpStatus.OK)
+  handoff(@Body() dto: HandoffDto): Promise<AuthSession> {
+    return this.handoffTokenService.exchange(dto.token);
   }
 
   @Public()

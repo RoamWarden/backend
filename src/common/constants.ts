@@ -102,6 +102,16 @@ export const EMAIL_OTP_RESEND_COOLDOWN_S = 60;
 export const EMAIL_OTP_MAX_SENDS_PER_WINDOW = 5;
 export const EMAIL_OTP_SEND_WINDOW_S = 60 * 60;
 
+// ── app → web account hand-off (build plan §20) ─────────────────────────────
+
+/**
+ * How long a single-use app→web hand-off token stays valid. Deliberately tiny:
+ * the token travels in a URL query string (which leaks into browser history,
+ * proxy logs and referrers), so the window is only as long as it takes the
+ * browser to open the account page.
+ */
+export const HANDOFF_TOKEN_TTL_S = 5 * 60;
+
 /** Default TTLs when env vars are absent. */
 export const DEFAULT_JWT_ACCESS_TTL = '15m';
 export const DEFAULT_JWT_REFRESH_TTL = '30d';

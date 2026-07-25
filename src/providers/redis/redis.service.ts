@@ -9,6 +9,7 @@ import Redis from 'ioredis';
 import {
   KEY_GEO_PRESENCE,
   KEY_ONLINE_SOCKETS,
+  SCRIPT_CLAIM_ONCE,
 } from './constant/redis.constants';
 
 /**
@@ -196,5 +197,33 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       }
       return null;
     }
+  }
+
+  // ── single-use tokens ─────────────────────────────────────────────────
+
+  /**
+   * Stores `value` under `key` with an expiry of `ttlS` seconds.
+   *
+   * Unlike `incrementCounter`, this deliberately does NOT swallow Redis errors:
+   * it backs security-sensitive single-use tokens, where a silent write failure
+   * would mint a token that can never be redeemed. The caller must surface the
+   * failure to the user.
+   */
+  async setWithTtl(key: string, value: string, ttlS: number): Promise<void> {
+    await this.client.set(key, value, 'EX', ttlS);
+  }
+
+  /**
+   * Atomically reads and deletes `key`, returning the stored value (or null if
+   * it was missing, already claimed, or expired).
+   *
+   * The GET+DEL happens inside a single Lua script, so it is indivisible: two
+   * concurrent callers can never both receive the value. That is what makes a
+   * token single-use even under a double-submit or a retry storm. Errors
+   * propagate — a Redis failure must fail CLOSED (no session), never fail open.
+   */
+  async claimOnce(key: string): Promise<string | null> {
+    const value: unknown = await this.client.eval(SCRIPT_CLAIM_ONCE, 1, key);
+    return typeof value === 'string' ? value : null;
   }
 }

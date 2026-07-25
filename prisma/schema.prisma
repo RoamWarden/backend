@@ -81,6 +81,22 @@ enum DevicePlatform {
   @@map("device_platform")
 }
 
+/// Lifecycle of a user's single subscription row (build plan §20).
+/// FREE      — on the free tier. Also what "no subscription row at all" means.
+/// PENDING   — a paid plan was selected but nothing has been paid. NO entitlements.
+/// ACTIVE    — paid and in good standing. ONLY a payment gateway may set this.
+/// CANCELLED — cancelled by the user; may still run out its paid period.
+/// EXPIRED   — a paid period lapsed without renewal.
+enum SubscriptionStatus {
+  FREE
+  PENDING
+  ACTIVE
+  CANCELLED
+  EXPIRED
+
+  @@map("subscription_status")
+}
+
 // ─────────────────────────────── identity ───────────────────────────────
 
 model User {
@@ -113,6 +129,9 @@ model User {
   alerts              Alert[]
   deviceTokens        DeviceToken[]
   sosEvents           SosEvent[]
+  // At most one subscription per user (enforced by a UNIQUE on subscriptions.user_id).
+  // Absent = the user is on the free tier; we never backfill a row for everyone.
+  subscription        Subscription?
 
   @@map("users")
 }
@@ -372,4 +391,58 @@ model SosEvent {
 
   @@index([userId])
   @@map("sos_events")
+}
+
+// ─────────────────────────────── billing ───────────────────────────────
+
+// Monetization catalog (build plan §20). Plans are DATA, not an enum in three
+// codebases: pricing and copy change with one seeded row, no app/web/API
+// redeploy. Only 'free' and 'premium' exist today — B2B tiers come later.
+// `priceAmountMinor` is the smallest currency unit (cents) so money is never a
+// float; 0 means free.
+model Plan {
+  id               String   @id @default(uuid()) @db.Uuid
+  code             String   @unique
+  name             String
+  description      String
+  priceAmountMinor Int      @default(0) @map("price_amount_minor")
+  currency         String   @default("USD")
+  /// Billing cadence of the price above — 'month' for every plan we sell today.
+  interval         String   @default("month")
+  /// Marketing bullet list, rendered verbatim by the app and the website.
+  features         String[]
+  isActive         Boolean  @default(true) @map("is_active")
+  sortOrder        Int      @default(0) @map("sort_order")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  subscriptions Subscription[]
+
+  @@index([isActive, sortOrder])
+  @@map("plans")
+}
+
+// A user's CURRENT plan choice — at most one row per user, enforced in the
+// database by the UNIQUE on user_id (never by app logic alone). No row at all
+// means "free": we deliberately do not backfill one for every existing user.
+// A paid plan can only ever be PENDING until a real payment gateway exists —
+// nothing in this codebase is allowed to write ACTIVE for a paid plan.
+model Subscription {
+  id                 String             @id @default(uuid()) @db.Uuid
+  userId             String             @unique @map("user_id") @db.Uuid
+  planId             String             @map("plan_id") @db.Uuid
+  status             SubscriptionStatus @default(FREE)
+  currentPeriodStart DateTime?          @map("current_period_start")
+  currentPeriodEnd   DateTime?          @map("current_period_end")
+  cancelAtPeriodEnd  Boolean            @default(false) @map("cancel_at_period_end")
+  createdAt          DateTime           @default(now()) @map("created_at")
+  updatedAt          DateTime           @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Restrict: a plan that people are on must not be deletable out from under them.
+  plan Plan @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  @@index([status])
+  @@index([planId])
+  @@map("subscriptions")
 }

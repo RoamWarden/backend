@@ -2,7 +2,7 @@
 
 Source of truth for cross-module boundaries. Every module MUST code against the
 exact names and signatures here. If a signature must change, change it here
-first. Derived from `RoamWarden-Build-Plan.pdf` §9–§14.
+first. Derived from `RoamWarden-Build-Plan.pdf` §9–§14 and §20 (monetization).
 
 ## Ground rules
 
@@ -27,8 +27,8 @@ first. Derived from `RoamWarden-Build-Plan.pdf` §9–§14.
 | Symbol | Where | Notes |
 |---|---|---|
 | `PrismaService` | `src/prisma/prisma.service` | global module |
-| `RedisService` | `src/providers/redis/redis.service` | global; presence GEO, online hash, `publishJson`, `createSubscriber()` |
-| channel/key constants | `src/providers/redis/redis.constants` | `CHANNEL_ALERT_INCIDENT`, `CHANNEL_SOS`, `channelTripLive(tripId)`, `PATTERN_TRIP_LIVE`, `keyDirectionsCache(hash)` |
+| `RedisService` | `src/providers/redis/redis.service` | global; presence GEO, online hash, `publishJson`, `createSubscriber()`, `setWithTtl(key, value, ttlS)`, `claimOnce(key)` |
+| channel/key constants | `src/providers/redis/redis.constants` | `CHANNEL_ALERT_INCIDENT`, `CHANNEL_SOS`, `channelTripLive(tripId)`, `PATTERN_TRIP_LIVE`, `keyDirectionsCache(hash)`, `keyPlacesCache(hash)`, `keyHandoffToken(tokenHash)` |
 | `Public()` / `IS_PUBLIC_KEY` | `src/common/decorators/public.decorator` | marks routes that skip the global JWT guard |
 | `CurrentUser()` | `src/common/decorators/current-user.decorator` | injects `AuthenticatedUser` |
 | `AccessTokenPayload`, `TripShareTokenPayload`, `AuthenticatedUser` | `src/common/types/auth.types` | |
@@ -50,6 +50,7 @@ first. Derived from `RoamWarden-Build-Plan.pdf` §9–§14.
 | realtime | `src/resources/realtime/` | Socket.IO gateway, Redis subscriber bridge |
 | sos | `src/resources/sos/` | `POST /sos`, `POST /sos/:id/resolve` |
 | geo | `src/resources/geo/` + `src/providers/google/` | `GET /geo/places/nearby`, `GET /geo/places/search`; `PlacesService` (Google Places proxy — key stays server-side) |
+| billing | `src/resources/billing/` | `GET /billing/plans`, `GET/POST /billing/subscription`, `POST /billing/portal-link`; `BillingService`, `isPremiumEntitled` |
 | integration | `src/app.module.ts` | wiring: ConfigModule(validateEnv), Throttler global guard, JwtAuthGuard as APP_GUARD, Sentry, ScheduleModule |
 
 A module may ONLY create/edit files inside its own directory. Cross-module
@@ -57,7 +58,7 @@ needs go through the exported services below.
 
 ## Exported service signatures
 
-### AuthModule (exports: `TokensService`, `TripShareTokenService`, `JwtAuthGuard`)
+### AuthModule (exports: `TokensService`, `TripShareTokenService`, `JwtAuthGuard`, `HandoffTokenService`)
 
 ```ts
 class TokensService {
@@ -75,6 +76,14 @@ class TripShareTokenService {
   issue(tripId: string): { token: string; expiresAt: Date };
   verify(token: string): TripShareTokenPayload; // throws UnauthorizedException
 }
+
+/** App → web account hand-off (§20). Redis-backed, 5 min TTL, single-use. */
+class HandoffTokenService {
+  /** For an ALREADY-authenticated user. Raw token returned once, never persisted. */
+  issue(userId: string): Promise<{ token: string; expiresAt: Date }>;
+  /** Burns the token, then mints a session exactly like login. Throws on reuse. */
+  exchange(rawToken: string): Promise<AuthSession>;
+}
 ```
 
 - `JwtAuthGuard` honours `@Public()`; on success sets `request.user: AuthenticatedUser`.
@@ -83,6 +92,15 @@ class TripShareTokenService {
   (web/ios/android; audience check), upserts user by `googleSub`, returns
   `{ accessToken, refreshToken, user }`. If no Google client id is configured →
   503 with a clear "Google Sign-In not configured" message.
+- `POST /auth/handoff` — `@Public()`, throttled 20/15 min. Body `{ token }` (the
+  `handoff` query param the app put in the account URL) → 200
+  `{ accessToken, refreshToken, user }`, the SAME shape as login. Hand-off tokens:
+  48 random bytes base64url, stored in Redis ONLY as an HMAC-SHA256 (keyed with
+  `JWT_REFRESH_SECRET`) under `keyHandoffToken(hash)` with a `HANDOFF_TOKEN_TTL_S`
+  (5 min) TTL; the value is the userId. Redemption is an ATOMIC Lua GET+DEL
+  (`RedisService.claimOnce`), so two concurrent exchanges can never both win.
+  Unknown / expired / already-used all give the SAME 401 message (no probing).
+  Redis unreachable → 503, never a session (fails closed).
 
 ### UsersModule (exports: `UsersService`)
 
@@ -271,6 +289,83 @@ REST (authed via the global JWT guard, no `@Public()`):
   `q` required, 2–120 chars (trimmed); `lat`/`lng` optional bias, only applied
   when both are present.
 
+### BillingModule (exports: `BillingService`)
+
+Monetization (build plan §20). Two consumer tiers only — Free and Premium; B2B
+duty-of-care tiers come later. **THERE IS NO PAYMENT GATEWAY.** No endpoint here
+charges anyone, contacts a processor, or grants a paid entitlement, and nothing in
+this codebase may write `ACTIVE` for a paid plan. Clients render "Pay now" as
+visibly inert and say payments aren't live yet.
+
+```ts
+class BillingService {
+  getPlans(): Promise<{ plans: PlanView[] }>;
+  /** No subscription row → the free plan with status FREE. NEVER 404s. */
+  getSubscription(userId: string): Promise<SubscriptionView>;
+  /** 'free' → FREE now; a priced plan → PENDING, never ACTIVE. */
+  selectPlan(userId: string, planCode: string): Promise<SelectPlanResult>;
+  createPortalLink(userId: string): Promise<{ url: string; expiresAt: Date }>;
+  /** The ONE entitlement question. Nothing is gated on it yet. */
+  isPremium(userId: string): Promise<boolean>;
+}
+
+/** Pure rule behind it, for tests/other modules: src/resources/billing/entitlements */
+function isPremiumEntitled(
+  s: { planCode: string; status: SubscriptionStatus } | null,
+): boolean; // null → false; 'free' → false; paid → only when ACTIVE
+
+interface PlanView {
+  code: string;              // 'free' | 'premium' — the client-facing key; row ids are NEVER exposed
+  name: string;
+  description: string;
+  priceAmountMinor: number;  // cents; 0 = free
+  currency: string;          // ISO-4217, e.g. 'USD'
+  interval: string;          // 'month'
+  priceFormatted: string;    // server-formatted: 'Free' | '$5.00' — clients append '/mo'
+  features: string[];        // marketing bullets, rendered verbatim in order
+  sortOrder: number;
+}
+
+interface SubscriptionView {
+  plan: PlanView;
+  status: 'FREE' | 'PENDING' | 'ACTIVE' | 'CANCELLED' | 'EXPIRED';
+  currentPeriodEnd: string | null; // ISO over the wire; null for FREE/PENDING
+  cancelAtPeriodEnd: boolean;
+  isPremium: boolean;              // false while PENDING — nobody paid
+  paymentAvailable: boolean;       // ALWAYS false until a gateway exists
+}
+
+interface SelectPlanResult extends SubscriptionView { message: string }
+```
+
+Data model: `plans` is a SEEDED CATALOG (migration `20260725090000_subscription_plans`),
+so copy/pricing change with a row update instead of three deploys. `subscriptions`
+holds AT MOST ONE row per user — enforced by a UNIQUE on `user_id`, not app logic.
+No row at all IS the free tier; users are never backfilled.
+
+REST:
+
+- `GET /billing/plans` — `@Public()` (the website pricing page must render
+  signed-out) → 200 `{ plans: PlanView[] }`, active plans only, ascending
+  `sortOrder`. An empty catalog is a misconfiguration, not a product decision →
+  503 with a clear message (never a silently empty pricing page).
+- `GET /billing/subscription` — authed → 200 `SubscriptionView`. A user with no
+  row resolves to the free plan with `status: 'FREE'`.
+- `POST /billing/subscription` — authed, body `{ planCode }` (the ONLY accepted
+  field — `forbidNonWhitelisted` rejects extras). Trimmed + lowercased, then
+  validated against the catalog; unknown code → 400 naming the codes that exist.
+  → 200 `SelectPlanResult`. `'free'` → `status: 'FREE'`, effective immediately.
+  A priced plan → `status: 'PENDING'`, `paymentAvailable: false`, `isPremium: false`,
+  and a `message` stating plainly that payments aren't available yet and nothing
+  was charged. It can NEVER return `'ACTIVE'`.
+- `POST /billing/portal-link` — authed, throttled 10/15 min, no body → 201
+  `{ url, expiresAt }`. `url` is `${WEB_APP_URL}/account?handoff=<single-use token>`
+  (host from config, never hardcoded; trailing slash stripped, token URL-encoded).
+  The app opens it in a browser — the Spotify pattern, the app sells nothing
+  in-app. Treat the URL as a secret: never log it. The web page swaps the token
+  via `POST /auth/handoff` for a normal session. The app must NEVER put its own
+  access/refresh token in a URL.
+
 ### Integration (app.module.ts)
 
 - `ConfigModule.forRoot({ isGlobal: true, validate: validateEnv })`
@@ -279,6 +374,10 @@ REST (authed via the global JWT guard, no `@Public()`):
 - `JwtAuthGuard` as APP_GUARD (after throttler).
 - `ScheduleModule.forRoot()`, `SentryModule` + `SentryGlobalFilter` (`@sentry/nestjs/setup`).
 - Health: keep `GET /health` public; extend to report db/redis status.
+- `WEB_APP_URL` is the website origin (password-reset page + the `/account` area).
+  The account area is a browser page calling this API cross-origin, so whenever
+  `CORS_ORIGINS` is set that origin MUST be in it, or the account page gets a CORS
+  failure instead of a session.
 
 ## Error envelope
 

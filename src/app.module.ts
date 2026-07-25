@@ -10,6 +10,7 @@ import { ResilientThrottlerStorage } from './common/throttler/resilient-throttle
 import { RedisService } from './providers/redis/redis.service';
 import { AlertsModule } from './resources/alert/alerts.module';
 import { AuthModule } from './resources/auth/auth.module';
+import { BillingModule } from './resources/billing/billing.module';
 import { JwtAuthGuard } from './resources/auth/jwt-auth.guard';
 import { validateEnv } from './config/env.validation';
 import { LoggerModule } from './logger/logger.module';
@@ -67,6 +68,7 @@ import { WaitlistModule } from './resources/waitlist/waitlist.module';
     RealtimeModule,
     SosModule,
     WaitlistModule,
+    BillingModule,
   ],
   controllers: [AppController],
   providers: [

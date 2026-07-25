@@ -34,3 +34,26 @@ export const keyDirectionsCache = (hash: string): string =>
 
 /** Places lookup cache — nearby + text search (cost control). */
 export const keyPlacesCache = (hash: string): string => `cache:places:${hash}`;
+
+/**
+ * Single-use app→web account hand-off token. The key embeds the HMAC of the
+ * token (NEVER the token itself); the value is the userId it authorises. The
+ * Redis TTL is the expiry, and `RedisService.claimOnce` makes redemption
+ * single-use.
+ */
+export const keyHandoffToken = (tokenHash: string): string =>
+  `handoff:${tokenHash}`;
+
+/**
+ * Atomic "read and burn". Redis executes a Lua script as ONE indivisible step,
+ * so two concurrent redemptions of the same key can never both see a value:
+ * exactly one gets it, the loser gets nil. (GETDEL does the same but needs
+ * Redis ≥ 6.2; EVAL works on every server we might be pointed at.)
+ */
+export const SCRIPT_CLAIM_ONCE = `
+local value = redis.call('GET', KEYS[1])
+if value then
+  redis.call('DEL', KEYS[1])
+end
+return value
+`;
