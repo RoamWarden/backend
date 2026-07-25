@@ -51,10 +51,46 @@ async function bootstrap() {
     .map((origin) => origin.trim())
     .filter(Boolean);
 
+  /**
+   * Our own web app is ALWAYS allowed, derived from WEB_APP_URL.
+   *
+   * WEB_APP_URL is already the canonical "where our front end lives" — it is what
+   * /billing/portal-link builds the app→web handoff against. Deriving the CORS
+   * entry from the same variable means the two cannot drift: previously the
+   * deployed site was a valid handoff target that the API then refused to talk
+   * to, so every browser fetch failed preflight and the pricing page reported
+   * "We couldn't reach RoamWarden" — a CORS rejection wearing a network error's
+   * clothes. Only the ORIGIN is taken (scheme + host + port); a path in
+   * WEB_APP_URL would never match a browser's Origin header.
+   */
+  const webAppOrigin = ((): string | null => {
+    const raw = process.env.WEB_APP_URL?.trim();
+    if (!raw) return null;
+    try {
+      return new URL(raw).origin;
+    } catch {
+      new Logger('Bootstrap').warn(
+        `WEB_APP_URL is not a valid URL (${raw}) — not adding it to the CORS allow-list`,
+      );
+      return null;
+    }
+  })();
+
+  const allowedOrigins = [
+    ...new Set([...corsOrigins, ...(webAppOrigin ? [webAppOrigin] : [])]),
+  ];
+
   app.enableCors({
-    origin: corsOrigins.length > 0 ? corsOrigins : true,
+    // No allow-list configured at all => reflect any origin. That is the local
+    // dev default; in production either CORS_ORIGINS or WEB_APP_URL is set.
+    origin: allowedOrigins.length > 0 ? allowedOrigins : true,
     credentials: true,
   });
+  new Logger('Bootstrap').log(
+    allowedOrigins.length > 0
+      ? `CORS allow-list: ${allowedOrigins.join(', ')}`
+      : 'CORS: no allow-list configured — reflecting all origins (development default)',
+  );
 
   app.useGlobalPipes(
     new ValidationPipe({
