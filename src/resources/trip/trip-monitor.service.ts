@@ -25,12 +25,35 @@ import { TripsService } from './trips.service';
  *     traveller with an "Are you OK?" push and flag the live view `overdue`.
  *  2. If that nudge went unanswered (no check-in) for TRIP_ESCALATE_AFTER_S →
  *     alert the traveller's consented linked contacts with a live-share link.
+ *  3. If the trip is STILL silent long after that, close it as CANCELLED and
+ *     say so. See TRIP_AUTO_CLOSE_SILENCE_S — the ladder used to have no last
+ *     rung, so a trip whose feed simply died stayed ACTIVE for ever.
  *
  * IMPORTANT: RoamWarden is NOT an emergency service. Messaging stays calm and
  * non-alarmist; the traveller and their contacts must still call local
  * emergency services themselves. The cron never throws — each trip is handled
  * in isolation so one failure can't abort the sweep.
  */
+
+/**
+ * How long an already-escalated trip may stay silent before the monitor closes
+ * it as CANCELLED.
+ *
+ * DELIBERATELY LONG, and deliberately CANCELLED. Closing someone's trip ends the
+ * monitoring they started it for, so this must never be a plausible gap in a
+ * real journey. It exists for the trips whose feed died for good — the app killed
+ * mid-arrival with breadcrumbs still queued on the phone, a flat battery, a
+ * sign-out (which stops tracking without telling the server). Those trips are
+ * ACTIVE for ever: the sweep re-reads them every minute doing nothing, they sit
+ * at the head of every `startedAt asc` page, and `ACTIVE_TRIP_CONFLICT_MSG`
+ * locks the traveller out of their next journey with no way to clear it.
+ *
+ * 6h matches TRIP_MAX_DURATION_S, so the earliest a trip can close this way is
+ * the full nudge + escalate ladder plus a whole trip's worth of silence on top.
+ * The clock also restarts at escalation, so the traveller always gets the entire
+ * window AFTER being asked whether they are OK.
+ */
+export const TRIP_AUTO_CLOSE_SILENCE_S = 6 * 3600;
 @Injectable()
 export class TripMonitorService {
   private readonly logger = new Logger(TripMonitorService.name);
@@ -171,6 +194,57 @@ export class TripMonitorService {
         tripId: trip.id,
         status: TripStatus.ACTIVE,
         escalated: true,
+      });
+      return;
+    }
+
+    // ── STAGE 3: close a trip whose feed died for good ──────────────────
+    //
+    // Reachable only once stage 2 has run (contacts alerted) AND nothing has
+    // been heard since — no breadcrumb, no check-in — for the whole silence
+    // window. Everything monitoring can do has been done; leaving the row ACTIVE
+    // past this point helps nobody and actively blocks the traveller's next trip.
+    if (trip.escalatedAt === null) return;
+
+    const lastSignOfLife = Math.max(
+      (trip.lastPointAt ?? trip.startedAt).getTime(),
+      trip.checkinAt?.getTime() ?? 0,
+      // Restart the clock at escalation so the traveller always gets the full
+      // window after being asked whether they are OK.
+      trip.escalatedAt.getTime(),
+    );
+    if (now - lastSignOfLife <= TRIP_AUTO_CLOSE_SILENCE_S * 1000) return;
+
+    // CANCELLED, and `autoCloseTrip` enforces that — never COMPLETED. We have no
+    // evidence this person arrived, and the contacts we alerted must not be told
+    // otherwise. Returns null if a real stop won the race; announce nothing then.
+    const closed = await this.trips.autoCloseTrip(trip.id);
+    if (closed === null) return;
+
+    const destination = trip.destLabel ?? 'your destination';
+    const silentHours = Math.floor(
+      (now - lastSignOfLife) / (3600 * 1000),
+    ).toString();
+
+    // The traveller first, and never silently: their trip ending on its own,
+    // with no arrival recorded, is something they have to be told plainly —
+    // not least because it is what unblocks starting the next one.
+    await this.notifications.sendToUsers([trip.userId], {
+      title: 'We closed your trip',
+      body: `Your trip to ${destination} stopped sending your location about ${silentHours} hours ago, so we've closed it. It was NOT recorded as an arrival. Start a new trip whenever you next set off.`,
+      data: { tripId: trip.id, kind: 'auto_closed' },
+    });
+
+    // These contacts were told this person "may need help" hours ago. Closing
+    // the trip in silence would leave that hanging; saying "closed" without
+    // saying "this is not an arrival" would answer it wrongly.
+    const contactUserIds = await this.trips.getWatcherUserIds(trip.id);
+    if (contactUserIds.length > 0) {
+      const ownerName = trip.user.name || 'Your contact';
+      await this.notifications.sendToUsers(contactUserIds, {
+        title: 'Trip closed automatically',
+        body: `${ownerName}'s trip to ${trip.destLabel ?? 'their destination'} stopped updating, so RoamWarden closed it. This does NOT mean they arrived safely — check in with them if you haven't already.`,
+        data: { tripId: trip.id, kind: 'auto_closed' },
       });
     }
   }

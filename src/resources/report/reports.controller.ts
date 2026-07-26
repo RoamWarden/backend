@@ -62,15 +62,42 @@ export class ReportsController {
     return this.reportsService.removeReport(admin.id, reportId, dto.reason);
   }
 
+  /**
+   * OWNER-ONLY self-retraction — "I filed this and I'm taking it back".
+   *
+   * A sibling of `:id/remove`, not a relaxation of it: that route keeps its
+   * AdminGuard and its meaning (a moderator taking somebody else's report down).
+   * POST rather than DELETE because nothing is deleted — the row survives with
+   * its removal audit, exactly as a takedown leaves it — and because every other
+   * state transition in this API (`/vote`, `/remove`, `/sos/:id/retract`,
+   * `/trips/:id/cancel`) is a POSTed verb. No body: a reporter withdrawing their
+   * own report owes nobody an explanation, and the reason is not forwarded
+   * anywhere.
+   */
+  @Post(':id/retract')
+  retractReport(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id', reportIdPipe) reportId: string,
+  ): Promise<ReportView> {
+    return this.reportsService.retractReport(user.id, reportId);
+  }
+
   @Get()
-  findByBbox(@Query() query: FindReportsQueryDto): Promise<ReportView[]> {
-    return this.reportsService.findByBbox(query.bbox, query.types);
+  findByBbox(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query() query: FindReportsQueryDto,
+  ): Promise<ReportView[]> {
+    return this.reportsService.findByBbox(user.id, query.bbox, query.types);
   }
 
   /** Declared before ':id' so 'near' is not swallowed by the param route. */
   @Get('near')
-  findNear(@Query() query: FindNearQueryDto): Promise<ReportView[]> {
+  findNear(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query() query: FindNearQueryDto,
+  ): Promise<ReportView[]> {
     return this.reportsService.findNear(
+      user.id,
       query.lat,
       query.lng,
       query.radiusM,
@@ -79,7 +106,10 @@ export class ReportsController {
   }
 
   @Get(':id')
-  getById(@Param('id', reportIdPipe) reportId: string): Promise<ReportView> {
-    return this.reportsService.getById(reportId);
+  getById(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id', reportIdPipe) reportId: string,
+  ): Promise<ReportView> {
+    return this.reportsService.getById(user.id, reportId);
   }
 }

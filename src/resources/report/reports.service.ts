@@ -32,6 +32,9 @@ import {
   BBOX_FORMAT_HINT,
   REPORT_NEAR_MAX_RADIUS_M,
   REPORT_QUERY_LIMIT,
+  REPORT_RETRACT_FORBIDDEN_MSG,
+  REPORT_RETRACT_NOT_FOUND_MSG,
+  REPORT_SELF_RETRACT_REASON,
 } from './constant/reports.constants';
 import type {
   CreateReportInput,
@@ -122,7 +125,7 @@ export class ReportsService {
       );
     }
 
-    return this.toView(report);
+    return this.toView(report, userId);
   }
 
   // ── clustering auto-verify ────────────────────────────────────────────
@@ -220,7 +223,118 @@ export class ReportsService {
       `Admin ${adminId} removed report ${reportId}: ${reason ?? '(no reason given)'}`,
     );
 
-    return this.toView(removed);
+    return this.toView(removed, adminId);
+  }
+
+  // ── self-retraction ───────────────────────────────────────────────────
+
+  /**
+   * THE REPORTER TAKES THEIR OWN REPORT DOWN.
+   *
+   * A different act from `removeReport` above, which is an admin takedown and
+   * keeps its AdminGuard: this one is owner-only and needs no moderator. It is
+   * ALWAYS ALLOWED — no edit window, no "too many confirmations, too late". A
+   * report is a claim about the world; the moment its author no longer stands
+   * behind it, nobody else should be routing around it, and a timer would just
+   * mean the honest correction arrives as a phone call to support instead.
+   *
+   * It lands in the SAME terminal state as a takedown (`REMOVED` + the removal
+   * audit columns, `removedById` = the reporter themselves) rather than a new
+   * enum value, so it needs no migration and inherits every existing exclusion:
+   * bbox, near, get-by-id-for-voting and `clusterVerifyNearby` all filter
+   * `status IN ('UNCONFIRMED','VERIFIED')`, so a retracted report stops showing
+   * on the map and stops counting toward anyone's cluster verification in the
+   * same write.
+   *
+   * WHAT IT DOES TO THE VOTES: nothing, on purpose. The `report_votes` rows stay
+   * as the audit of what people saw at the time, but they can no longer matter —
+   * the report is out of every query, `vote()` refuses a non-active report, and
+   * the counts are frozen where they stood. What DOES get undone is the reward:
+   * if the community had already verified this report, its author earned
+   * `REPUTATION_REPORT_VERIFIED`, and keeping that for content they have just
+   * withdrawn is a free reputation farm (file, get cluster-verified, retract,
+   * repeat). That reversal is NOT a retraction penalty — the codebase has no
+   * such thing for reports and this does not invent one. A REJECTED report's
+   * `REPUTATION_REPORT_REJECTED` is deliberately NOT refunded: retracting must
+   * not be a way to erase a penalty you already earned.
+   *
+   * IDEMPOTENT: retracting an already-removed report succeeds quietly and does
+   * not overwrite an admin's audit trail or reverse the reputation twice.
+   */
+  async retractReport(userId: string, reportId: string): Promise<ReportView> {
+    const report = await this.prisma.report.findUnique({
+      where: { id: reportId },
+    });
+    if (!report) {
+      throw new NotFoundException(REPORT_RETRACT_NOT_FOUND_MSG);
+    }
+    // 403, not the SOS module's 404-for-everything: a report id is not a secret
+    // (it is on the public map), so there is no existence to protect here, and a
+    // stranger who taps this deserves to be told why it is not theirs to remove.
+    if (report.reporterId !== userId) {
+      throw new ForbiddenException(REPORT_RETRACT_FORBIDDEN_MSG);
+    }
+    // Already down (their own second tap, or an admin got there first). Nothing
+    // to do, and nothing to overwrite — the existing audit trail stands.
+    if (report.status === ReportStatus.REMOVED) {
+      return this.toView(report, userId);
+    }
+
+    const retracted = await this.prisma.$transaction(async (tx) => {
+      // The same row lock the vote path takes. Without it a voter can flip this
+      // report UNCONFIRMED→VERIFIED between our read and our write, and we would
+      // either miss the reward reversal or apply it against a status that never
+      // happened. Holding the lock makes "what was it when I removed it?" a
+      // question with one answer.
+      await tx.$queryRaw`SELECT id FROM reports WHERE id = ${reportId}::uuid FOR UPDATE`;
+
+      const fresh = await tx.report.findUniqueOrThrow({
+        where: { id: reportId },
+        select: { status: true },
+      });
+      if (fresh.status === ReportStatus.REMOVED) {
+        // Lost the race to a concurrent takedown/retraction — it is already
+        // where the caller wanted it. Report the row, charge nothing.
+        return null;
+      }
+
+      const updated = await tx.report.update({
+        where: { id: reportId },
+        data: {
+          status: ReportStatus.REMOVED,
+          removedById: userId,
+          removedReason: REPORT_SELF_RETRACT_REASON,
+          removedAt: new Date(),
+        },
+      });
+
+      // Give back the verification reward — and only that. See the doc block.
+      if (fresh.status === ReportStatus.VERIFIED) {
+        await tx.user.update({
+          where: { id: userId },
+          data: { reputation: { decrement: REPUTATION_REPORT_VERIFIED } },
+        });
+      }
+
+      return updated;
+    });
+
+    if (!retracted) {
+      // The concurrent writer won; re-read so the caller still gets the truth.
+      const current = await this.prisma.report.findUnique({
+        where: { id: reportId },
+      });
+      if (!current) {
+        throw new NotFoundException(REPORT_RETRACT_NOT_FOUND_MSG);
+      }
+      return this.toView(current, userId);
+    }
+
+    this.logger.log(
+      `User ${userId} retracted their own report ${reportId} (was ${report.status})`,
+    );
+
+    return this.toView(retracted, userId);
   }
 
   // ── vote ──────────────────────────────────────────────────────────────
@@ -321,12 +435,16 @@ export class ReportsService {
       return tx.report.findUniqueOrThrow({ where: { id: reportId } });
     });
 
-    return this.toView(updated);
+    return this.toView(updated, userId);
   }
 
   // ── queries ───────────────────────────────────────────────────────────
 
-  async findByBbox(bbox: string, types?: string): Promise<ReportView[]> {
+  async findByBbox(
+    viewerId: string,
+    bbox: string,
+    types?: string,
+  ): Promise<ReportView[]> {
     const { minLng, minLat, maxLng, maxLat } = this.parseBbox(bbox);
     const typeList = this.parseTypes(types);
     const typeFilter =
@@ -339,7 +457,8 @@ export class ReportsService {
              confirm_count AS "confirmCount",
              deny_count    AS "denyCount",
              created_at    AS "createdAt",
-             expires_at    AS "expiresAt"
+             expires_at    AS "expiresAt",
+             (reporter_id = ${viewerId}::uuid) AS "mine"
       FROM reports
       WHERE status IN ('UNCONFIRMED', 'VERIFIED')
         AND expires_at > now()
@@ -352,6 +471,7 @@ export class ReportsService {
   }
 
   async findNear(
+    viewerId: string,
     lat: number,
     lng: number,
     radiusM: number,
@@ -384,7 +504,8 @@ export class ReportsService {
              confirm_count AS "confirmCount",
              deny_count    AS "denyCount",
              created_at    AS "createdAt",
-             expires_at    AS "expiresAt"
+             expires_at    AS "expiresAt",
+             (reporter_id = ${viewerId}::uuid) AS "mine"
       FROM reports
       WHERE status IN ('UNCONFIRMED', 'VERIFIED')
         AND expires_at > now()
@@ -396,7 +517,7 @@ export class ReportsService {
     return rows.map((row) => this.rowToView(row));
   }
 
-  async getById(reportId: string): Promise<ReportView> {
+  async getById(viewerId: string, reportId: string): Promise<ReportView> {
     const report = await this.prisma.report.findUnique({
       where: { id: reportId },
     });
@@ -405,7 +526,7 @@ export class ReportsService {
         'Report not found — it may have been removed. Refresh the map and try again.',
       );
     }
-    return this.toView(report);
+    return this.toView(report, viewerId);
   }
 
   // ── expiry cron ───────────────────────────────────────────────────────
@@ -477,8 +598,12 @@ export class ReportsService {
     return parsed as ReportType[];
   }
 
-  /** Strips the reporter's identity — never expose reporterId (privacy §17). */
-  private toView(report: Report): ReportView {
+  /**
+   * Strips the reporter's identity — never expose reporterId (privacy §17).
+   * `viewerId` is compared here and then discarded: the caller learns only
+   * whether the report is THEIRS, which is what the retract affordance needs.
+   */
+  private toView(report: Report, viewerId: string): ReportView {
     return {
       id: report.id,
       type: report.type,
@@ -490,9 +615,14 @@ export class ReportsService {
       denyCount: report.denyCount,
       createdAt: report.createdAt,
       expiresAt: report.expiresAt,
+      mine: report.reporterId === viewerId,
     };
   }
 
+  /**
+   * The geo queries never SELECT `reporter_id` — they compare it in SQL and
+   * return the boolean, so the identity never leaves the database.
+   */
   private rowToView(row: ReportRow): ReportView {
     return {
       id: row.id,
@@ -505,6 +635,7 @@ export class ReportsService {
       denyCount: row.denyCount,
       createdAt: row.createdAt,
       expiresAt: row.expiresAt,
+      mine: row.mine,
     };
   }
 }

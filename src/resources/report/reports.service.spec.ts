@@ -20,7 +20,12 @@ import {
   REPUTATION_REPORT_REJECTED,
   REPUTATION_REPORT_VERIFIED,
 } from '../../common/constants';
-import { BBOX_FORMAT_HINT } from './constant/reports.constants';
+import {
+  BBOX_FORMAT_HINT,
+  REPORT_RETRACT_FORBIDDEN_MSG,
+  REPORT_RETRACT_NOT_FOUND_MSG,
+  REPORT_SELF_RETRACT_REASON,
+} from './constant/reports.constants';
 import { haversineMeters } from '../../common/utils/geo.util';
 
 const REPORTER_ID = '11111111-1111-1111-1111-111111111111';
@@ -29,6 +34,25 @@ const REPORT_ID = '33333333-3333-3333-3333-333333333333';
 
 /** `expect.any(Date)` typed as Date so it can sit inside typed matcher literals. */
 const ANY_DATE = expect.any(Date) as unknown as Date;
+
+/**
+ * The SQL text of a recorded `$queryRaw` call, whichever way it was made: a
+ * tagged template (first arg is the strings array) or a prebuilt `Prisma.sql`
+ * fragment (which carries the same strings on `.strings`).
+ *
+ * Asserting on the text is the only way to prove a STATUS FILTER from a unit
+ * test — the exclusion of retracted (REMOVED) reports lives in raw SQL, not in
+ * a Prisma `where` object we could inspect.
+ */
+function sqlTextOf(call: unknown): string {
+  const args = (call ?? []) as unknown[];
+  const first = args[0];
+  if (Array.isArray(first)) return (first as string[]).join(' ');
+  if (first && typeof first === 'object' && 'strings' in first) {
+    return (first as { strings: string[] }).strings.join(' ');
+  }
+  return String(first);
+}
 
 // A point in Lagos we treat as the reporter's ground truth.
 const HERE = { lat: 6.5244, lng: 3.3792 };
@@ -319,6 +343,7 @@ describe('ReportsService', () => {
         'denyCount',
         'createdAt',
         'expiresAt',
+        'mine',
       ]);
       expect(view.note).toBe('armed men at the junction');
     });
@@ -573,10 +598,10 @@ describe('ReportsService', () => {
 
   describe('findByBbox', () => {
     it('throws BadRequestException with a format hint for a malformed bbox', async () => {
-      await expect(service.findByBbox('not-a-bbox')).rejects.toThrow(
+      await expect(service.findByBbox(VOTER_ID, 'not-a-bbox')).rejects.toThrow(
         BadRequestException,
       );
-      await expect(service.findByBbox('1,2,3')).rejects.toThrow(
+      await expect(service.findByBbox(VOTER_ID, '1,2,3')).rejects.toThrow(
         BBOX_FORMAT_HINT,
       );
       expect(prismaMock.$queryRaw).not.toHaveBeenCalled();
@@ -584,9 +609,9 @@ describe('ReportsService', () => {
 
     it('throws BadRequestException when bbox coordinates are out of range or min > max', async () => {
       // min lng greater than max lng.
-      await expect(service.findByBbox('3.42,6.44,3.35,6.52')).rejects.toThrow(
-        BadRequestException,
-      );
+      await expect(
+        service.findByBbox(VOTER_ID, '3.42,6.44,3.35,6.52'),
+      ).rejects.toThrow(BadRequestException);
       expect(prismaMock.$queryRaw).not.toHaveBeenCalled();
     });
 
@@ -602,10 +627,12 @@ describe('ReportsService', () => {
         denyCount: 0,
         createdAt: new Date('2026-07-22T10:00:00.000Z'),
         expiresAt: new Date('2026-07-22T14:00:00.000Z'),
+        // The query compares reporter_id in SQL and returns only this boolean.
+        mine: false,
       };
       prismaMock.$queryRaw.mockResolvedValue([row]);
 
-      const views = await service.findByBbox('3.35,6.44,3.42,6.52');
+      const views = await service.findByBbox(VOTER_ID, '3.35,6.44,3.42,6.52');
 
       expect(prismaMock.$queryRaw).toHaveBeenCalledTimes(1);
       expect(views).toHaveLength(1);
@@ -621,6 +648,7 @@ describe('ReportsService', () => {
         denyCount: 0,
         createdAt: row.createdAt,
         expiresAt: row.expiresAt,
+        mine: false,
       });
     });
 
@@ -628,6 +656,7 @@ describe('ReportsService', () => {
       prismaMock.$queryRaw.mockResolvedValue([]);
 
       const views = await service.findByBbox(
+        VOTER_ID,
         '3.35,6.44,3.42,6.52',
         'ROBBERY,checkpoint',
       );
@@ -638,7 +667,7 @@ describe('ReportsService', () => {
 
     it('rejects an unknown report type in the filter', async () => {
       await expect(
-        service.findByBbox('3.35,6.44,3.42,6.52', 'NOT_A_TYPE'),
+        service.findByBbox(VOTER_ID, '3.35,6.44,3.42,6.52', 'NOT_A_TYPE'),
       ).rejects.toThrow(BadRequestException);
       expect(prismaMock.$queryRaw).not.toHaveBeenCalled();
     });
@@ -870,7 +899,217 @@ describe('ReportsService', () => {
         'denyCount',
         'createdAt',
         'expiresAt',
+        'mine',
       ]);
+    });
+  });
+
+  // ── retractReport (owner self-retraction) ───────────────────────────────
+
+  describe('retractReport', () => {
+    const ADMIN_ID = '88888888-8888-8888-8888-888888888888';
+
+    it('lets the author take their own report down, with the self-retraction audit', async () => {
+      prismaMock.report.findUnique.mockResolvedValue(buildReport());
+      txMock.report.findUniqueOrThrow.mockResolvedValue({
+        status: ReportStatus.UNCONFIRMED,
+      });
+      txMock.report.update.mockResolvedValue(
+        buildReport({
+          status: ReportStatus.REMOVED,
+          removedById: REPORTER_ID,
+          removedReason: REPORT_SELF_RETRACT_REASON,
+          removedAt: new Date(),
+        }),
+      );
+
+      const view = await service.retractReport(REPORTER_ID, REPORT_ID);
+
+      expect(txMock.report.update).toHaveBeenCalledWith({
+        where: { id: REPORT_ID },
+        data: {
+          status: ReportStatus.REMOVED,
+          // removedById is the REPORTER on a self-retraction — that equality is
+          // what tells it apart from an admin takedown in the audit.
+          removedById: REPORTER_ID,
+          removedReason: REPORT_SELF_RETRACT_REASON,
+          removedAt: ANY_DATE,
+        },
+      });
+      expect(view.status).toBe(ReportStatus.REMOVED);
+      expect(view.mine).toBe(true);
+      expect(view).not.toHaveProperty('reporterId');
+    });
+
+    it('refuses a report the caller did not file — 403 with the reason, and no write', async () => {
+      prismaMock.report.findUnique.mockResolvedValue(buildReport());
+
+      await expect(service.retractReport(VOTER_ID, REPORT_ID)).rejects.toThrow(
+        ForbiddenException,
+      );
+      await expect(service.retractReport(VOTER_ID, REPORT_ID)).rejects.toThrow(
+        REPORT_RETRACT_FORBIDDEN_MSG,
+      );
+      expect(prismaMock.$transaction).not.toHaveBeenCalled();
+      expect(txMock.report.update).not.toHaveBeenCalled();
+    });
+
+    it('throws NotFoundException when the report does not exist', async () => {
+      prismaMock.report.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.retractReport(REPORTER_ID, REPORT_ID),
+      ).rejects.toThrow(NotFoundException);
+      await expect(
+        service.retractReport(REPORTER_ID, REPORT_ID),
+      ).rejects.toThrow(REPORT_RETRACT_NOT_FOUND_MSG);
+      expect(prismaMock.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('is idempotent on an already-removed report and never overwrites an admin audit', async () => {
+      const removedAt = new Date('2026-07-22T11:00:00.000Z');
+      prismaMock.report.findUnique.mockResolvedValue(
+        buildReport({
+          status: ReportStatus.REMOVED,
+          removedById: ADMIN_ID,
+          removedReason: 'abuse',
+          removedAt,
+        }),
+      );
+
+      const view = await service.retractReport(REPORTER_ID, REPORT_ID);
+
+      // Already where the caller wanted it: no transaction, no second write, no
+      // second reputation reversal, and the admin's reason survives.
+      expect(view.status).toBe(ReportStatus.REMOVED);
+      expect(prismaMock.$transaction).not.toHaveBeenCalled();
+      expect(txMock.report.update).not.toHaveBeenCalled();
+      expect(txMock.user.update).not.toHaveBeenCalled();
+    });
+
+    it('gives back the verification reward when the retracted report was VERIFIED', async () => {
+      prismaMock.report.findUnique.mockResolvedValue(
+        buildReport({ status: ReportStatus.VERIFIED }),
+      );
+      txMock.report.findUniqueOrThrow.mockResolvedValue({
+        status: ReportStatus.VERIFIED,
+      });
+      txMock.report.update.mockResolvedValue(
+        buildReport({ status: ReportStatus.REMOVED, removedById: REPORTER_ID }),
+      );
+
+      await service.retractReport(REPORTER_ID, REPORT_ID);
+
+      // A reversal of the award that was granted, not a retraction penalty.
+      expect(txMock.user.update).toHaveBeenCalledTimes(1);
+      expect(txMock.user.update).toHaveBeenCalledWith({
+        where: { id: REPORTER_ID },
+        data: { reputation: { decrement: REPUTATION_REPORT_VERIFIED } },
+      });
+    });
+
+    it('touches reputation for no other status — an UNCONFIRMED retraction is free', async () => {
+      prismaMock.report.findUnique.mockResolvedValue(buildReport());
+      txMock.report.findUniqueOrThrow.mockResolvedValue({
+        status: ReportStatus.UNCONFIRMED,
+      });
+      txMock.report.update.mockResolvedValue(
+        buildReport({ status: ReportStatus.REMOVED, removedById: REPORTER_ID }),
+      );
+
+      await service.retractReport(REPORTER_ID, REPORT_ID);
+
+      expect(txMock.user.update).not.toHaveBeenCalled();
+    });
+
+    it('keeps the -5 of a REJECTED report — retracting must not erase a penalty', async () => {
+      prismaMock.report.findUnique.mockResolvedValue(
+        buildReport({ status: ReportStatus.REJECTED }),
+      );
+      txMock.report.findUniqueOrThrow.mockResolvedValue({
+        status: ReportStatus.REJECTED,
+      });
+      txMock.report.update.mockResolvedValue(
+        buildReport({ status: ReportStatus.REMOVED, removedById: REPORTER_ID }),
+      );
+
+      await service.retractReport(REPORTER_ID, REPORT_ID);
+
+      expect(txMock.user.update).not.toHaveBeenCalled();
+    });
+
+    it('writes nothing when a concurrent takedown won the row lock', async () => {
+      prismaMock.report.findUnique
+        // First read (pre-lock): still active.
+        .mockResolvedValueOnce(buildReport())
+        // Re-read after the lost race, for the honest answer.
+        .mockResolvedValueOnce(
+          buildReport({ status: ReportStatus.REMOVED, removedById: ADMIN_ID }),
+        );
+      // Inside the lock it is already gone.
+      txMock.report.findUniqueOrThrow.mockResolvedValue({
+        status: ReportStatus.REMOVED,
+      });
+
+      const view = await service.retractReport(REPORTER_ID, REPORT_ID);
+
+      expect(txMock.report.update).not.toHaveBeenCalled();
+      expect(txMock.user.update).not.toHaveBeenCalled();
+      expect(view.status).toBe(ReportStatus.REMOVED);
+    });
+
+    it('takes the same row lock the vote path takes', async () => {
+      prismaMock.report.findUnique.mockResolvedValue(buildReport());
+      txMock.report.findUniqueOrThrow.mockResolvedValue({
+        status: ReportStatus.UNCONFIRMED,
+      });
+      txMock.report.update.mockResolvedValue(
+        buildReport({ status: ReportStatus.REMOVED }),
+      );
+
+      await service.retractReport(REPORTER_ID, REPORT_ID);
+
+      // FOR UPDATE, or a voter can verify the report between our read and write.
+      expect(txMock.$queryRaw).toHaveBeenCalledTimes(1);
+      expect(sqlTextOf(txMock.$queryRaw.mock.calls[0])).toContain('FOR UPDATE');
+    });
+  });
+
+  // ── retracted reports disappear from the read paths ─────────────────────
+
+  describe('retracted reports are excluded from the geo queries', () => {
+    it('bbox only ever selects UNCONFIRMED/VERIFIED rows', async () => {
+      prismaMock.$queryRaw.mockResolvedValue([]);
+
+      await service.findByBbox(REPORTER_ID, '3.35,6.44,3.42,6.52');
+
+      const sql = sqlTextOf(prismaMock.$queryRaw.mock.calls[0]);
+      // REMOVED (which is where a retraction lands) can never match this filter.
+      expect(sql).toContain("status IN ('UNCONFIRMED', 'VERIFIED')");
+      expect(sql).not.toContain('REMOVED');
+      // Authorship is compared in SQL; reporter_id itself is never selected.
+      expect(sql).toContain('AS "mine"');
+    });
+
+    it('near only ever selects UNCONFIRMED/VERIFIED rows', async () => {
+      prismaMock.$queryRaw.mockResolvedValue([]);
+
+      await service.findNear(REPORTER_ID, HERE.lat, HERE.lng, 2000);
+
+      const sql = sqlTextOf(prismaMock.$queryRaw.mock.calls[0]);
+      expect(sql).toContain("status IN ('UNCONFIRMED', 'VERIFIED')");
+      expect(sql).not.toContain('REMOVED');
+      expect(sql).toContain('AS "mine"');
+    });
+
+    it('cluster auto-verify never counts a retracted report toward a cluster', async () => {
+      prismaMock.$queryRaw.mockResolvedValue([]);
+
+      await service.clusterVerifyNearby(buildReport() as never);
+
+      const sql = sqlTextOf(prismaMock.$queryRaw.mock.calls[0]);
+      expect(sql).toContain("status IN ('UNCONFIRMED', 'VERIFIED')");
+      expect(sql).not.toContain('REMOVED');
     });
   });
 });

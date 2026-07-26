@@ -439,7 +439,10 @@ export class TripsService {
       }
     }
 
-    const updated = await this.completeTrip(trip, TripStatus.COMPLETED);
+    const { trip: updated } = await this.completeTrip(
+      trip,
+      TripStatus.COMPLETED,
+    );
     return { trip: updated };
   }
 
@@ -463,8 +466,46 @@ export class TripsService {
   ): Promise<{ trip: Trip }> {
     const trip = await this.getOwnedTrip(user.id, tripId);
     if (!this.isLive(trip)) return { trip };
-    const updated = await this.completeTrip(trip, TripStatus.CANCELLED);
+    const { trip: updated } = await this.completeTrip(
+      trip,
+      TripStatus.CANCELLED,
+    );
     return { trip: updated };
+  }
+
+  /**
+   * Close a journey the monitor has given up on. **Only `TripMonitorService`
+   * calls this**, and only after its full escalation ladder has run and the trip
+   * has been silent for a long time on top — see `TRIP_AUTO_CLOSE_SILENCE_S`.
+   *
+   * CANCELLED, NEVER COMPLETED, and this is not a detail. A trip whose feed died
+   * is a trip we cannot vouch for; `COMPLETED` sends "arrived safely" to the very
+   * contacts we alerted a moment ago on the strength of nothing but silence. The
+   * point of closing it is that an ACTIVE row nobody can end is not monitoring —
+   * it is a permanently stuck sweep entry that also blocks every future trip with
+   * ACTIVE_TRIP_CONFLICT_MSG.
+   *
+   * ACTIVE-ONLY by design: an SOS trip is never closed behind the traveller's
+   * back. (The sweep only selects ACTIVE, but the guard is restated here so the
+   * rule survives a change of caller.)
+   *
+   * Routed through the shared `completeTrip` so endedAt/durationS, the presence
+   * clear and the `trip:status` publish all happen exactly once, under the same
+   * race guard every other ending uses.
+   *
+   * @returns the closed trip, or null if it had already ended (a stop that
+   *   landed between the sweep's read and this write) — the caller must not
+   *   announce a close it did not make.
+   */
+  async autoCloseTrip(tripId: string): Promise<Trip | null> {
+    const trip = await this.prisma.trip.findUnique({ where: { id: tripId } });
+    if (!trip || trip.status !== TripStatus.ACTIVE) return null;
+
+    const { trip: updated, changed } = await this.completeTrip(
+      trip,
+      TripStatus.CANCELLED,
+    );
+    return changed ? updated : null;
   }
 
   /**
@@ -793,7 +834,7 @@ export class TripsService {
   private async completeTrip(
     trip: Trip,
     status: typeof TripStatus.COMPLETED | typeof TripStatus.CANCELLED,
-  ): Promise<Trip> {
+  ): Promise<{ trip: Trip; changed: boolean }> {
     const endedAt = new Date();
     const durationS = Math.max(
       0,
@@ -819,8 +860,10 @@ export class TripsService {
     });
     if (count === 0) {
       // Lost the race — another request already ended this trip. Do not
-      // re-publish or re-notify; just return the current state.
-      return updated;
+      // re-publish or re-notify; just return the current state. `changed: false`
+      // is how a caller that must only announce its OWN close (the monitor's
+      // auto-close) tells the difference.
+      return { trip: updated, changed: false };
     }
 
     // The trip is over — the owner's last position should not linger in the
@@ -867,7 +910,7 @@ export class TripsService {
       }
     }
 
-    return updated;
+    return { trip: updated, changed: true };
   }
 
   /** Single multi-row INSERT of breadcrumbs with geography set per row. */

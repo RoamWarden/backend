@@ -874,6 +874,97 @@ describe('TripsService', () => {
     });
   });
 
+  // ── autoCloseTrip (the trip-monitor's last rung) ────────────────────────
+
+  describe('autoCloseTrip', () => {
+    it('closes an ACTIVE trip as CANCELLED and never as an arrival', async () => {
+      const trip = baseTrip();
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+      prisma.trip.updateMany.mockResolvedValueOnce({ count: 1 });
+      prisma.trip.findUniqueOrThrow.mockResolvedValueOnce({
+        ...trip,
+        status: TripStatus.CANCELLED,
+        endedAt: new Date(),
+        durationS: 3600,
+      });
+
+      const result = await service.autoCloseTrip('trip-1');
+
+      expect(result?.status).toBe(TripStatus.CANCELLED);
+      expect(prisma.trip.updateMany).toHaveBeenCalledWith({
+        where: { id: 'trip-1', status: { in: LIVE_STATUSES } },
+        data: {
+          status: TripStatus.CANCELLED,
+          endedAt: ANY_DATE,
+          durationS: ANY_NUMBER,
+        },
+      });
+      // Full teardown, exactly as a real cancel: presence gone, watchers told.
+      expect(redis.clearPresence).toHaveBeenCalledWith(owner.id);
+      expect(redis.publishJson).toHaveBeenCalledWith(
+        channelTripLive('trip-1'),
+        expect.objectContaining({
+          kind: 'status',
+          status: TripStatus.CANCELLED,
+        }),
+      );
+      // THE WHOLE POINT OF CANCELLED: no "arrived safely" push for a journey we
+      // cannot vouch for. `completeTrip` only sends that on COMPLETED.
+      expect(notifications.sendToUsers).not.toHaveBeenCalled();
+    });
+
+    it('REFUSES to close a trip in SOS — an alarm is never ended behind the traveller', async () => {
+      prisma.trip.findUnique.mockResolvedValueOnce({
+        ...baseTrip(),
+        status: TripStatus.SOS,
+      });
+
+      await expect(service.autoCloseTrip('trip-1')).resolves.toBeNull();
+
+      expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+      expect(redis.clearPresence).not.toHaveBeenCalled();
+    });
+
+    it.each([TripStatus.COMPLETED, TripStatus.CANCELLED])(
+      'returns null for a trip that already ended (%s), so the caller announces nothing',
+      async (status) => {
+        prisma.trip.findUnique.mockResolvedValueOnce({
+          ...baseTrip(),
+          status,
+          endedAt: new Date('2026-07-22T09:00:00Z'),
+        });
+
+        await expect(service.autoCloseTrip('trip-1')).resolves.toBeNull();
+
+        expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+      },
+    );
+
+    it('returns null when a real stop wins the race (guarded update matched 0 rows)', async () => {
+      const trip = baseTrip();
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+      prisma.trip.updateMany.mockResolvedValueOnce({ count: 0 });
+      prisma.trip.findUniqueOrThrow.mockResolvedValueOnce({
+        ...trip,
+        status: TripStatus.COMPLETED,
+        endedAt: new Date(),
+      });
+
+      await expect(service.autoCloseTrip('trip-1')).resolves.toBeNull();
+
+      // The winner already published and notified. Do neither again.
+      expect(redis.publishJson).not.toHaveBeenCalled();
+      expect(notifications.sendToUsers).not.toHaveBeenCalled();
+    });
+
+    it('returns null for a trip that does not exist', async () => {
+      prisma.trip.findUnique.mockResolvedValueOnce(null);
+
+      await expect(service.autoCloseTrip('nope')).resolves.toBeNull();
+      expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
   // ── addPoints auto-arrival ──────────────────────────────────────────────
 
   describe('addPoints auto-arrival', () => {

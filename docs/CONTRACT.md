@@ -329,11 +329,50 @@ Live-channel message shapes (published on `channelTripLive(tripId)`):
   forbidden; recompute counts; VERIFIED at `REPORT_VERIFY_THRESHOLD` confirms
   (reputation `+REPUTATION_REPORT_VERIFIED` once), REJECTED when denies ≥
   `REPORT_REJECT_THRESHOLD` and > confirms (reputation `REPUTATION_REPORT_REJECTED` once).
+- `POST /reports/:id/remove` `{ reason? }` — ADMIN takedown (`AdminGuard`). Sets `REMOVED`
+  plus the removal audit (`removedById` = the admin, `removedReason`, `removedAt`).
+- `POST /reports/:id/retract` — OWNER self-retraction: "I filed this and I am taking it
+  back". No body. NOT a relaxation of `/remove`, which keeps its `AdminGuard`.
+  - **Authorisation**: only `reporterId === caller`. Anyone else → **403** with
+    `REPORT_RETRACT_FORBIDDEN_MSG`. Unknown id → **404** with `REPORT_RETRACT_NOT_FOUND_MSG`.
+    403 rather than the SOS module's 404-for-everything: a report id is on the public map,
+    so there is no existence to protect.
+  - **ALWAYS ALLOWED** — no edit window, no "too many confirmations, too late". A report is
+    a claim about the world; once its author withdraws it nobody should be routing around it.
+  - **ZERO MIGRATIONS, deliberately**: it lands in the existing `ReportStatus.REMOVED` with
+    the existing removal audit columns, not a new enum value. Every read path already filters
+    `status IN ('UNCONFIRMED','VERIFIED')`, so one write drops the report out of bbox, near
+    AND `clusterVerifyNearby` at once. A self-retraction is told apart from a takedown by
+    `removed_by_id = reporter_id`; `removed_reason` carries `REPORT_SELF_RETRACT_REASON`.
+  - **Votes**: untouched. `report_votes` rows stay as the audit of what people saw, but can
+    no longer matter — the report is out of every query, `vote()` refuses a non-active
+    report, and the counts freeze where they stood.
+  - **Verification**: a retracted report stops counting toward any neighbour's cluster
+    verification immediately. Neighbours ALREADY promoted stay promoted — that promotion was
+    a fact at the time, and demoting would claw back other people's reputation.
+  - **Reputation**: if the report was `VERIFIED`, its `+REPUTATION_REPORT_VERIFIED` award is
+    given back — once, inside the same `FOR UPDATE` lock the vote path takes — because
+    otherwise "file → get cluster-verified → retract" is a free reputation farm. That is a
+    REVERSAL of an award, **not** a retraction penalty: reports have no such penalty and this
+    does not add one. A `REJECTED` report's `REPUTATION_REPORT_REJECTED` is NOT refunded —
+    retracting must never erase a penalty already earned.
+  - **Idempotent**: retracting an already-REMOVED report succeeds quietly, does not overwrite
+    an admin's audit trail, and never reverses reputation twice.
+  - Already-delivered alerts are NOT recalled: a push that has landed cannot be unsent, and
+    inventing a "never mind" push for a community report is noise, not safety.
 - `GET /reports?bbox=minLng,minLat,maxLng,maxLat&types=` — active (UNCONFIRMED|VERIFIED,
   unexpired) in viewport via `ST_MakeEnvelope`/`&&`; cap 200, newest first. Reporter
   identity is NEVER exposed in any report response (privacy §17) — return counts + type + location + note + status + timestamps only.
 - `GET /reports/near?lat=&lng=&radiusM=` — same shape, `ST_DWithin`.
 - `GET /reports/:id`
+- **`mine: boolean` on EVERY report response** (create, vote, remove, retract, bbox, near,
+  get-by-id) — ADDITIVE. Computed per request against the caller; the geo queries compare
+  `reporter_id` in SQL and select only the boolean, so the identity never leaves the
+  database. It exists so a client knows which report carries its own retract action, and it
+  is the ONLY authorship signal — `reporterId` is still shipped to nobody.
+  **The `alert:incident` socket payload has no `mine`** (it is published to the people NEAR a
+  report, never to its author), so a client must read an ABSENT `mine` as UNKNOWN, i.e. not
+  mine — never as authorship.
 - Cron (`@nestjs/schedule`, every 5 min): expire past-due reports.
 
 ### AlertsModule (exports: `AlertsService`)

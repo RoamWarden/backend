@@ -1,7 +1,10 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { Logger } from '@nestjs/common';
 import { TripStatus } from '@prisma/client';
-import { TripMonitorService } from './trip-monitor.service';
+import {
+  TRIP_AUTO_CLOSE_SILENCE_S,
+  TripMonitorService,
+} from './trip-monitor.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../providers/redis/redis.service';
 import { NotificationsService } from '../notification/notifications.service';
@@ -61,7 +64,11 @@ describe('TripMonitorService', () => {
   };
   let notifications: { sendToUsers: AnyMock };
   let redis: { publishJson: AnyMock };
-  let trips: { getWatcherUserIds: AnyMock; buildLiveShareUrl: AnyMock };
+  let trips: {
+    getWatcherUserIds: AnyMock;
+    buildLiveShareUrl: AnyMock;
+    autoCloseTrip: AnyMock;
+  };
 
   beforeEach(async () => {
     // Freeze the clock so dueAt / escalate-window arithmetic is deterministic.
@@ -85,6 +92,8 @@ describe('TripMonitorService', () => {
         .mockReturnValue(
           'https://api.roamwarden.test/trips/trip-1/live?token=x',
         ),
+      // Default null = "someone else already ended it", the conservative answer.
+      autoCloseTrip: jest.fn().mockResolvedValue(null),
     };
 
     const moduleRef: TestingModule = await Test.createTestingModule({
@@ -293,6 +302,152 @@ describe('TripMonitorService', () => {
       expect(trips.getWatcherUserIds).not.toHaveBeenCalled();
       expect(prisma.trip.updateMany).not.toHaveBeenCalled();
       expect(notifications.sendToUsers).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── STAGE 3: close a trip whose feed died ───────────────────────────────
+
+  describe('escalateOverdueTrips — stage 3 (auto-close)', () => {
+    /** An escalated trip that has been silent for longer than the window. */
+    function abandonedTrip(
+      overrides: Partial<MonitoredTrip> = {},
+    ): MonitoredTrip {
+      const silentSince = new Date(
+        NOW - (TRIP_AUTO_CLOSE_SILENCE_S + 3600) * 1000,
+      );
+      return overdueTrip({
+        startedAt: silentSince,
+        lastPointAt: silentSince,
+        overdueNotifiedAt: silentSince,
+        escalatedAt: silentSince,
+        ...overrides,
+      });
+    }
+
+    /** The Trip row `autoCloseTrip` resolves with once it has closed one. */
+    function closedRow(id = 'trip-1'): { id: string; status: TripStatus } {
+      return { id, status: TripStatus.CANCELLED };
+    }
+
+    it('closes an escalated trip that has been silent past the window, as CANCELLED', async () => {
+      const trip = abandonedTrip();
+      prisma.trip.findMany.mockResolvedValue([trip]);
+      trips.autoCloseTrip.mockResolvedValue(closedRow(trip.id));
+
+      await service.escalateOverdueTrips();
+
+      // The service chooses the status; the monitor only asks for the close.
+      expect(trips.autoCloseTrip).toHaveBeenCalledWith(trip.id);
+      // The ladder's own stages must not fire again on the way past.
+      expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('tells the TRAVELLER plainly, and never as an arrival', async () => {
+      const trip = abandonedTrip();
+      prisma.trip.findMany.mockResolvedValue([trip]);
+      trips.autoCloseTrip.mockResolvedValue(closedRow(trip.id));
+
+      await service.escalateOverdueTrips();
+
+      const [recipients, message] = notifications.sendToUsers.mock.calls[0] as [
+        string[],
+        { title: string; body: string; data: { kind: string } },
+      ];
+      expect(recipients).toEqual([OWNER_ID]);
+      expect(message.data.kind).toBe('auto_closed');
+      expect(message.body).toContain('NOT recorded as an arrival');
+      expect(message.body).not.toMatch(/arrived safely/i);
+    });
+
+    it('tells the contacts it alarmed that this is NOT a safe arrival', async () => {
+      const trip = abandonedTrip();
+      prisma.trip.findMany.mockResolvedValue([trip]);
+      trips.autoCloseTrip.mockResolvedValue(closedRow(trip.id));
+      trips.getWatcherUserIds.mockResolvedValue([CONTACT_ID]);
+
+      await service.escalateOverdueTrips();
+
+      expect(notifications.sendToUsers).toHaveBeenCalledTimes(2);
+      const [recipients, message] = notifications.sendToUsers.mock.calls[1] as [
+        string[],
+        { body: string; data: { kind: string } },
+      ];
+      expect(recipients).toEqual([CONTACT_ID]);
+      expect(message.data.kind).toBe('auto_closed');
+      expect(message.body).toContain('does NOT mean they arrived safely');
+    });
+
+    it('does NOT close a trip that has not been escalated', async () => {
+      // Silent for a week, but the ladder never ran — stage 3 is not its rung.
+      const trip = abandonedTrip({
+        overdueNotifiedAt: null,
+        escalatedAt: null,
+      });
+      prisma.trip.findMany.mockResolvedValue([trip]);
+
+      await service.escalateOverdueTrips();
+
+      expect(trips.autoCloseTrip).not.toHaveBeenCalled();
+    });
+
+    it('does NOT close before the silence window has elapsed', async () => {
+      const trip = abandonedTrip({
+        escalatedAt: new Date(NOW - (TRIP_AUTO_CLOSE_SILENCE_S - 60) * 1000),
+      });
+      prisma.trip.findMany.mockResolvedValue([trip]);
+
+      await service.escalateOverdueTrips();
+
+      expect(trips.autoCloseTrip).not.toHaveBeenCalled();
+    });
+
+    it('restarts the silence clock at escalation, not at the last breadcrumb', async () => {
+      // Breadcrumbs died long ago, but contacts were only alerted a minute ago:
+      // the traveller must get the whole window AFTER being asked if they are OK.
+      const trip = abandonedTrip({ escalatedAt: new Date(NOW - 60 * 1000) });
+      prisma.trip.findMany.mockResolvedValue([trip]);
+
+      await service.escalateOverdueTrips();
+
+      expect(trips.autoCloseTrip).not.toHaveBeenCalled();
+    });
+
+    it('restarts the silence clock on a check-in', async () => {
+      const trip = abandonedTrip({ checkinAt: new Date(NOW - 60 * 1000) });
+      prisma.trip.findMany.mockResolvedValue([trip]);
+
+      await service.escalateOverdueTrips();
+
+      expect(trips.autoCloseTrip).not.toHaveBeenCalled();
+    });
+
+    it('announces nothing when a real stop won the race (autoCloseTrip → null)', async () => {
+      const trip = abandonedTrip();
+      prisma.trip.findMany.mockResolvedValue([trip]);
+      trips.autoCloseTrip.mockResolvedValue(null);
+      trips.getWatcherUserIds.mockResolvedValue([CONTACT_ID]);
+
+      await service.escalateOverdueTrips();
+
+      expect(trips.autoCloseTrip).toHaveBeenCalledWith(trip.id);
+      expect(notifications.sendToUsers).not.toHaveBeenCalled();
+    });
+
+    it('keeps sweeping when the close itself throws', async () => {
+      const bad = abandonedTrip({ id: 'bad-trip' });
+      const good = abandonedTrip({ id: 'good-trip', userId: 'owner-2' });
+      prisma.trip.findMany.mockResolvedValue([bad, good]);
+      trips.autoCloseTrip
+        .mockRejectedValueOnce(new Error('db blip'))
+        .mockResolvedValue(closedRow('good-trip'));
+
+      await expect(service.escalateOverdueTrips()).resolves.toBeUndefined();
+
+      expect(notifications.sendToUsers).toHaveBeenCalledTimes(1);
+      expect(notifications.sendToUsers).toHaveBeenCalledWith(
+        ['owner-2'],
+        expect.objectContaining({ title: 'We closed your trip' }),
+      );
     });
   });
 
