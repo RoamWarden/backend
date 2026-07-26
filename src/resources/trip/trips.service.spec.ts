@@ -367,6 +367,42 @@ describe('TripsService', () => {
       expect(result.total).toBe(1);
     });
 
+    it("attaches each trip's watcher contact ids in ONE batched query", async () => {
+      const a = { ...baseTrip(), id: 'trip-a' };
+      const b = { ...baseTrip(), id: 'trip-b' };
+      paged([a, b], 2);
+      prisma.tripWatcher.findMany.mockResolvedValueOnce([
+        { tripId: 'trip-a', contactId: 'contact-1' },
+        { tripId: 'trip-a', contactId: 'contact-2' },
+      ]);
+
+      const result = await service.listTrips(owner.id, {});
+
+      // Shared trip reports its real watchers…
+      expect(result.trips[0].watcherContactIds).toEqual([
+        'contact-1',
+        'contact-2',
+      ]);
+      // …and a trip with no rows reports a KNOWN empty list, which is what lets
+      // the client say "nobody" instead of guessing.
+      expect(result.trips[1].watcherContactIds).toEqual([]);
+      // One query for the whole page, not one per trip.
+      expect(prisma.tripWatcher.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.tripWatcher.findMany).toHaveBeenCalledWith({
+        where: { tripId: { in: ['trip-a', 'trip-b'] } },
+        select: { tripId: true, contactId: true },
+      });
+    });
+
+    it('queries no watchers at all for an empty page', async () => {
+      paged([], 0);
+
+      const result = await service.listTrips(owner.id, {});
+
+      expect(result.trips).toEqual([]);
+      expect(prisma.tripWatcher.findMany).not.toHaveBeenCalled();
+    });
+
     it('reports the window as information: enforced false, since null', async () => {
       paged([], 0);
 
@@ -417,6 +453,35 @@ describe('TripsService', () => {
       expect(prisma.trip.findMany).toHaveBeenCalledWith(
         expect.objectContaining({ skip: 200, take: 100 }),
       );
+    });
+  });
+
+  // ── getTrip ─────────────────────────────────────────────────────────────
+
+  describe('getTrip', () => {
+    it("returns the trip's watcher contact ids on the detail payload", async () => {
+      prisma.trip.findUnique.mockResolvedValue(baseTrip());
+      prisma.tripWatcher.findMany.mockResolvedValueOnce([
+        { contactId: 'contact-9' },
+      ]);
+
+      const result = await service.getTrip(owner.id, 'trip-1');
+
+      expect(result.trip.watcherContactIds).toEqual(['contact-9']);
+      expect(prisma.tripWatcher.findMany).toHaveBeenCalledWith({
+        where: { tripId: 'trip-1' },
+        select: { contactId: true },
+      });
+    });
+
+    it('returns an empty list — not a missing field — when nobody is watching', async () => {
+      prisma.trip.findUnique.mockResolvedValue(baseTrip());
+
+      const result = await service.getTrip(owner.id, 'trip-1');
+
+      // The client distinguishes "we asked and it is empty" from "we never
+      // knew", so the key must be present and the array real.
+      expect(result.trip.watcherContactIds).toEqual([]);
     });
   });
 

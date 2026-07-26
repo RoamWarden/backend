@@ -51,6 +51,7 @@ import type {
   RouteGeoJsonRow,
   TripHistoryWindow,
   TripPointView,
+  TripWithWatchers,
 } from './type/trips.types';
 
 @Injectable()
@@ -542,7 +543,7 @@ export class TripsService {
     userId: string,
     query: ListTripsQueryDto,
   ): Promise<{
-    trips: Trip[];
+    trips: TripWithWatchers[];
     total: number;
     page: number;
     limit: number;
@@ -567,7 +568,7 @@ export class TripsService {
       this.prisma.trip.count({ where }),
     ]);
     return {
-      trips,
+      trips: await this.withWatchers(trips),
       total,
       page,
       limit,
@@ -582,11 +583,47 @@ export class TripsService {
     };
   }
 
+  /**
+   * Attach each trip's watcher contact ids in ONE query, whatever the page size.
+   *
+   * Batched on purpose: the obvious per-trip lookup is an N+1 that grows with
+   * the history page. An empty array here is a real answer — this trip has no
+   * watcher rows — which is exactly what lets a client distinguish "shared with
+   * nobody" from "I was never told", the confusion that produced false
+   * "Nobody is following" copy on shared journeys.
+   */
+  private async withWatchers(trips: Trip[]): Promise<TripWithWatchers[]> {
+    if (trips.length === 0) return [];
+    const rows = await this.prisma.tripWatcher.findMany({
+      where: { tripId: { in: trips.map((trip) => trip.id) } },
+      select: { tripId: true, contactId: true },
+    });
+    const byTrip = new Map<string, string[]>();
+    for (const row of rows) {
+      const list = byTrip.get(row.tripId);
+      if (list) list.push(row.contactId);
+      else byTrip.set(row.tripId, [row.contactId]);
+    }
+    return trips.map((trip) => ({
+      ...trip,
+      watcherContactIds: byTrip.get(trip.id) ?? [],
+    }));
+  }
+
+  /** The watcher contact ids for a single trip. See {@link withWatchers}. */
+  private async watcherContactIds(tripId: string): Promise<string[]> {
+    const rows = await this.prisma.tripWatcher.findMany({
+      where: { tripId },
+      select: { contactId: true },
+    });
+    return rows.map((row) => row.contactId);
+  }
+
   async getTrip(
     userId: string,
     tripId: string,
   ): Promise<{
-    trip: Trip;
+    trip: TripWithWatchers;
     route: { source: string | null; geojson: unknown } | null;
     points: TripPointView[];
   }> {
@@ -607,7 +644,14 @@ export class TripsService {
       : null;
 
     const points = await this.lastPoints(tripId, TRIP_DETAIL_POINT_LIMIT);
-    return { trip, route, points };
+    return {
+      trip: {
+        ...trip,
+        watcherContactIds: await this.watcherContactIds(tripId),
+      },
+      route,
+      points,
+    };
   }
 
   async getLiveView(

@@ -297,6 +297,16 @@ REST (owner-auth unless stated):
   notification to watchers (FCM + live channel status).
 - `POST /trips/:id/cancel`
 - `GET /trips?status=&page=&limit=` → own history; `GET /trips/:id` → detail incl. route + last 100 points.
+  - Each trip row on BOTH of these carries `watcherContactIds: string[]` — the ids of the
+    trusted contacts watching it, from `trip_watchers.contact_id`, i.e. the SAME id space as
+    `GET /me/contacts`, so a client resolves them to names without another round trip.
+    Batched server-side (one query per page), so it is not an N+1.
+  - ADDITIVE, and ABSENT ELSEWHERE: `POST /trips/:id/stop`, `/cancel` and `/share` return the
+    bare trip row with no such field. **A client must read an absent value as UNKNOWN, never
+    as "nobody".** An EMPTY ARRAY is a real answer (this trip has no watchers) and may be
+    stated as such. The app previously manufactured `[]` for every trip and printed it as
+    fact — "Nobody is following" on Home, "Private journey" in the history, a no-contacts
+    warning on the trip screen — for journeys that were genuinely shared.
 - `GET /trips/:id/live?token=` — `@Public()`; accepts EITHER a valid share token for
   this trip OR a Bearer JWT of the owner/linked watcher. Returns trip meta, last
   ~50 points, active reports within 1km of the corridor. Never leaks other trips.

@@ -1,4 +1,26 @@
+import type { Trip } from '@prisma/client';
+
 import type { LimitValue } from '../../../common/entitlements';
+
+/**
+ * A trip row plus the ids of the trusted contacts watching it.
+ *
+ * WHY THIS EXISTS. `watcherContactIds` is not a scalar on the Prisma model — the
+ * links live in `trip_watchers` — so a raw trip row carries no answer to "who
+ * can see this journey?". The app nevertheless had a `watcherContactIds` field
+ * and, receiving nothing, MANUFACTURED `[]` and printed it as fact: "Nobody is
+ * following" on Home, "Private journey · no watchers selected" in the history,
+ * and a no-contacts warning on the trip screen — for journeys that were shared
+ * with several people. On a safety app that is the worst direction to be wrong
+ * in, so the server now answers the question instead of the client guessing.
+ *
+ * The ids are `TripWatcher.contactId` — the SAME id space as `GET /me/contacts`,
+ * so a client can resolve them to names without another round trip.
+ *
+ * ADDITIVE: this is a new property on an existing object. Older clients ignore
+ * it, and an absent value must be read as UNKNOWN, never as "nobody".
+ */
+export type TripWithWatchers = Trip & { watcherContactIds: string[] };
 
 /**
  * How far back a caller's trip history reaches, and how far their plan SAYS it
