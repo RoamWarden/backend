@@ -276,6 +276,21 @@ describe('TripStatsService', () => {
     });
   });
 
+  it('counts a trip in SOS as IN PROGRESS, not as a finished journey', async () => {
+    await service.getStats(USER_ID);
+
+    // The live set has to match TripsService (LIVE_TRIP_STATUSES). If SOS ever
+    // drops out of this FILTER, a traveller mid-alarm silently becomes a
+    // statistic with no outcome — counted in `trips` and in nothing else.
+    const aggregate = issued.get('aggregate');
+    expect(aggregate?.text).toContain(
+      "FILTER (WHERE t.status IN ('ACTIVE', 'SOS'))",
+    );
+    expect(aggregate?.text).toContain(
+      "FILTER (WHERE t.status = 'CANCELLED')::int",
+    );
+  });
+
   it('returns the most-travelled routes and destinations as the server ranked them', async () => {
     const stats = await service.getStats(USER_ID);
 

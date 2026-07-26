@@ -12,6 +12,7 @@ import {
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../../common/types/auth.types';
 import { RaiseSosDto } from './dto/raise-sos.dto';
+import { RetractSosDto } from './dto/retract-sos.dto';
 import { SosService } from './sos.service';
 
 /** Rejects malformed SOS event ids before they reach Prisma. */
@@ -41,6 +42,26 @@ export class SosController {
     @Param('id', sosIdPipe) id: string,
   ): ReturnType<SosService['resolve']> {
     return this.sos.resolve(user, id);
+  }
+
+  /**
+   * The traveller WITHDRAWS an alert (false alarm, pocket dial, scare passed).
+   *
+   * Separate from /resolve on purpose: /resolve says "I am safe now" about an
+   * SOS that happened, this says "that should not have gone out". It stops the
+   * escalation AND tells the contacts the alert actually reached to stand down,
+   * and it costs the traveller a small, bounded amount of reputation.
+   *
+   * Idempotent — a second call returns the same answer instead of an error.
+   */
+  @Post(':id/retract')
+  @HttpCode(HttpStatus.OK)
+  retract(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id', sosIdPipe) id: string,
+    @Body() dto: RetractSosDto,
+  ): ReturnType<SosService['retract']> {
+    return this.sos.retract(user, id, dto);
   }
 
   /**

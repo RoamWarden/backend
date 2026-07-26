@@ -659,6 +659,13 @@ never break a safety feature.
   master switch. It MUST stay false until checkout is live — true takes features
   away from users who cannot buy them back. No app.module wiring is needed:
   `EntitlementsModule` is `@Global` and BillingModule registers it.
+- `SOS_ESCALATION_ENABLED` (`'true' | 'false'`, default false) is the SOS
+  escalation master switch, independent of any plan. It MUST stay false until a
+  client can stop a ladder (`POST /sos/:id/resolve` and `POST /sos/:id/ack`) —
+  armed without them, every SOS runs to exhaustion and tells the traveller no one
+  answered, which the server cannot know. Off changes nothing else: contacts are
+  still alerted at once, the delivery trail is still recorded for every user, and
+  retraction still stands those contacts down.
 - `WEB_APP_URL` is the website origin (password-reset page + the `/account` area).
   The account area is a browser page calling this API cross-origin, so whenever
   `CORS_ORIGINS` is set that origin MUST be in it, or the account page gets a CORS

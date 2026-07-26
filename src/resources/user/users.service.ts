@@ -261,6 +261,63 @@ export class UsersService {
     return unique.filter((id) => consented.has(id));
   }
 
+  // ── reputation ────────────────────────────────────────────────────────
+
+  /**
+   * Applies a BOUNDED reputation penalty in one atomic statement.
+   *
+   *   reputation = GREATEST(reputation + penalty, LEAST(reputation, floor))
+   *
+   * Read the inner `LEAST` carefully — it is the whole point. A naive
+   * `GREATEST(reputation + penalty, floor)` would RAISE someone who is already
+   * below the floor for other reasons (rejected reports go lower than any single
+   * feature's floor), turning a punishment into a gift. `LEAST(reputation,
+   * floor)` makes the clamp "never push them below the floor, and never move
+   * them up": a user under the floor is simply left where they are.
+   *
+   * ONE STATEMENT, not read-modify-write: two concurrent penalties must both
+   * land and neither may clobber the other's read. Postgres evaluates the
+   * arithmetic and the clamp under the row lock the UPDATE already takes.
+   *
+   * WHO SHOULD CALL THIS: the caller owns "should this be charged at all?" and
+   * must have already won an idempotency guard, because this method itself is
+   * NOT idempotent — calling it twice charges twice, by design.
+   *
+   * @param penalty must be <= 0. A positive value would be a reward, and a
+   * reward routed through a floor clamp is a bug, so it is refused loudly.
+   * @param floor the lowest value this penalty may drive the user to.
+   * @returns the reputation after the write, or null if the user no longer
+   * exists (a deleted account is not an error worth failing a caller over).
+   */
+  async applyBoundedReputationPenalty(
+    userId: string,
+    penalty: number,
+    floor: number,
+  ): Promise<number | null> {
+    if (penalty > 0) {
+      throw new Error(
+        `applyBoundedReputationPenalty received a positive delta (${penalty}) — it clamps against a floor and must never be used to award reputation.`,
+      );
+    }
+
+    const rows = await this.prisma.$queryRaw<{ reputation: number }[]>`
+      UPDATE "users"
+      SET "reputation" = GREATEST(
+        "reputation" + ${penalty}::int,
+        LEAST("reputation", ${floor}::int)
+      )
+      WHERE "id" = ${userId}::uuid
+      RETURNING "reputation"
+    `;
+    if (rows.length === 0) {
+      this.logger.warn(
+        `Reputation penalty of ${penalty} skipped — user ${userId} no longer exists`,
+      );
+      return null;
+    }
+    return rows[0].reputation;
+  }
+
   // ── profile ───────────────────────────────────────────────────────────
 
   async getProfile(userId: string): Promise<ProfileWithCounts> {

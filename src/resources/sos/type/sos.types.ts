@@ -87,6 +87,10 @@ export interface SosTrailView {
   sosId: string;
   raisedAt: string;
   resolvedAt: string | null;
+  /** Set when the traveller WITHDREW this alert (never the same as resolving). */
+  retractedAt: string | null;
+  /** Their own words for why, when they gave any. */
+  retractReason: string | null;
   escalation: SosEscalationView | null;
   attempts: SosDeliveryAttemptView[];
   notice: string;
@@ -97,6 +101,56 @@ export interface SosAckResult {
   acknowledgedAt: string;
   /** Did this acknowledgement stop a ladder that was still paging? */
   escalationStopped: boolean;
+  notice: string;
+}
+
+/**
+ * Published on `CHANNEL_SOS_RETRACTED` when a traveller withdraws an SOS, so a
+ * contact with the app open can clear the alarm without waiting for a push.
+ * Carries NO location, NO trip and NO share link — a withdrawal must not be a
+ * second delivery of the thing being withdrawn.
+ */
+export interface SosRetractedMessage {
+  sosId: string;
+  user: { id: string; name: string };
+  /** The traveller's own words, when they gave any. */
+  reason?: string;
+  /** ISO-8601. */
+  retractedAt: string;
+  /** Exactly the contacts who were actually reached by the original alert. */
+  contactUserIds: string[];
+}
+
+/** What the retraction stand-down actually managed to do. */
+export interface SosRetractionNotifyResult {
+  /** Contacts we told, i.e. those the original SOS actually reached. */
+  notifiedContactCount: number;
+  /** Set when we could NOT tell them — the traveller has to hear this. */
+  warning?: string;
+}
+
+/** The reputation half of a retraction. Bounded, once, and explained. */
+export interface SosRetractionReputation {
+  /** Applied by THIS call: the penalty, or 0 for a repeat/failed write. */
+  penalty: number;
+  /** Reputation after the penalty, when we could read it back. */
+  value: number | null;
+  /** Plain-language explanation. Never just a number. */
+  note: string;
+}
+
+export interface RetractSosResult {
+  sosId: string;
+  retractedAt: string;
+  /** True when this call found it already withdrawn (idempotent, not an error). */
+  alreadyRetracted: boolean;
+  /** Did this call actually halt a paging ladder that was still running? */
+  escalationStopped: boolean;
+  /** How many already-reached contacts were told to stand down. */
+  notifiedContactCount: number;
+  reputation: SosRetractionReputation;
+  /** Set when something the traveller needs to know about went wrong. */
+  warning?: string;
   notice: string;
 }
 

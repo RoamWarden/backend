@@ -171,6 +171,34 @@ export class EnvironmentVariables {
       'ENFORCE_PLAN_LIMITS must be "true" or "false" (leave it unset or false until billing is live — true takes features away from users on the Free plan).',
   })
   ENFORCE_PLAN_LIMITS?: string;
+
+  /**
+   * MASTER SWITCH for the SOS escalation ladder (re-paging trusted contacts one
+   * at a time after an unanswered SOS). Unset defaults to FALSE, and false is
+   * the shipping state.
+   *
+   * IT STAYS OFF UNTIL A CLIENT CAN ACKNOWLEDGE AN ESCALATION. The ladder's only
+   * stop conditions are the traveller resolving their SOS (POST /sos/:id/resolve)
+   * and a trusted contact acknowledging it (POST /sos/:id/ack). The shipped app
+   * calls neither, so an armed ladder would run every SOS to exhaustion and then
+   * push the traveller "No one has answered your SOS" — something the server
+   * cannot know, on the screen where a false alarm costs the most.
+   *
+   * Off changes nothing else about SOS: every consenting contact is still
+   * alerted at once, the delivery trail is still recorded for every user, and a
+   * withdrawal still stands those contacts down. Validated rather than left
+   * free-form so a typo ('yes', 'TRUE ') fails at boot instead of quietly
+   * meaning something.
+   */
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.trim().toLowerCase() : value,
+  )
+  @IsIn(['true', 'false'], {
+    message:
+      'SOS_ESCALATION_ENABLED must be "true" or "false" (leave it unset or false until the app can resolve and acknowledge an SOS — otherwise every SOS ends by telling the traveller nobody answered).',
+  })
+  SOS_ESCALATION_ENABLED?: string;
 }
 
 export function validateEnv(

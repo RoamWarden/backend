@@ -168,6 +168,9 @@ export class TripStatsService {
           COUNT(*)::int                                             AS "trips",
           COUNT(*) FILTER (WHERE t.status = 'COMPLETED')::int       AS "completed",
           COUNT(*) FILTER (WHERE t.status = 'CANCELLED')::int       AS "cancelled",
+          -- ACTIVE + SOS is the live set (LIVE_TRIP_STATUSES in
+          -- constant/trips.constants.ts): an alarm does not end a journey, so a
+          -- trip in SOS is in progress, not a finished one. Keep the two in step.
           COUNT(*) FILTER (WHERE t.status IN ('ACTIVE', 'SOS'))::int AS "inProgress",
           COUNT(*) FILTER (WHERE t.checkin_at IS NOT NULL)::int     AS "checkins",
           COUNT(*) FILTER (WHERE t.duration_s IS NOT NULL)::int     AS "finishedTrips",

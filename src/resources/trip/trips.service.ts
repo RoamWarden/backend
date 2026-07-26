@@ -32,12 +32,19 @@ import { CreateTripDto } from './dto/create-trip.dto';
 import { ListTripsQueryDto } from './dto/list-trips.query.dto';
 import { StopTripDto } from './dto/stop-trip.dto';
 import {
+  ACTIVE_TRIP_CONFLICT_MSG,
+  CHECKIN_DURING_SOS_MSG,
   LIVE_LINK_INVALID_MSG,
+  LIVE_TRIP_STATUSES,
   LIVE_VIEW_POINT_LIMIT,
   LIVE_VIEW_REPORT_LIMIT,
   LIVE_VIEW_REPORT_RADIUS_M,
+  SOS_TRIP_CONFLICT_MSG,
   TRIP_DETAIL_POINT_LIMIT,
   TRIP_NOT_FOUND_MSG,
+  checkinEndedMsg,
+  isLiveTripStatus,
+  pointsRejectedMsg,
 } from './constant/trips.constants';
 import type {
   LiveViewReport,
@@ -64,10 +71,34 @@ export class TripsService {
 
   // ── contract exports (used by realtime + sos) ─────────────────────────
 
+  /**
+   * The user's ACTIVE trip. Deliberately narrow: this is what the SOS module
+   * calls to find the journey an alarm belongs to, and a trip already in SOS is
+   * not a new trip to attach to. For "does this user have a journey running?"
+   * use {@link getLiveTripForUser} — SOS counts there.
+   */
   async getActiveTripForUser(userId: string): Promise<Trip | null> {
     return this.prisma.trip.findFirst({
       where: { userId, status: TripStatus.ACTIVE },
     });
+  }
+
+  /**
+   * The user's journey that is still under way — ACTIVE **or** SOS. An alarm
+   * does not end a trip, so a trip in SOS must still occupy the one-live-trip
+   * slot; otherwise a traveller mid-alarm can start a second trip on top of the
+   * first and the two fight over one presence key and one background GPS task.
+   */
+  private async getLiveTripForUser(userId: string): Promise<Trip | null> {
+    return this.prisma.trip.findFirst({
+      where: { userId, status: { in: [...LIVE_TRIP_STATUSES] } },
+      orderBy: { startedAt: 'desc' },
+    });
+  }
+
+  /** True while this trip is still running (ACTIVE or SOS). */
+  private isLive(trip: Pick<Trip, 'status'>): boolean {
+    return isLiveTripStatus(trip.status);
   }
 
   /**
@@ -146,10 +177,14 @@ export class TripsService {
     shareTokenExpiresAt: Date;
     shareUrl: string;
   }> {
-    const active = await this.getActiveTripForUser(user.id);
-    if (active) {
+    // A trip in SOS is still running, so it blocks a new one just like an ACTIVE
+    // trip does — with copy that matches what the traveller is looking at.
+    const live = await this.getLiveTripForUser(user.id);
+    if (live) {
       throw new ConflictException(
-        'You already have an active trip — stop or cancel it before starting a new one.',
+        live.status === TripStatus.SOS
+          ? SOS_TRIP_CONFLICT_MSG
+          : ACTIVE_TRIP_CONFLICT_MSG,
       );
     }
 
@@ -239,9 +274,7 @@ export class TripsService {
       ) {
         // The partial unique index caught a second ACTIVE trip created in the
         // TOCTOU window after the pre-check above — surface the same 409.
-        throw new ConflictException(
-          'You already have an active trip — stop or cancel it before starting a new one.',
-        );
+        throw new ConflictException(ACTIVE_TRIP_CONFLICT_MSG);
       }
       throw err;
     }
@@ -295,10 +328,12 @@ export class TripsService {
     dto: AddPointsDto,
   ): Promise<{ accepted: number; autoCompleted: boolean }> {
     const trip = await this.getOwnedTrip(user.id, tripId);
-    if (trip.status !== TripStatus.ACTIVE) {
-      throw new ConflictException(
-        `This trip is ${trip.status.toLowerCase()} — location points can only be added to an active trip.`,
-      );
+    // SOS accepts breadcrumbs. It used to 409 here, and because the app treats
+    // any non-429/408 4xx on this route as "this trip is dead" it tore the
+    // background GPS task down — the location feed cut out at the exact moment
+    // an alarm was open. A live trip is a live trip.
+    if (!this.isLive(trip)) {
+      throw new ConflictException(pointsRejectedMsg(trip.status));
     }
     if (dto.points.length > TRIP_POINTS_MAX_BATCH) {
       throw new BadRequestException(
@@ -344,13 +379,21 @@ export class TripsService {
     });
 
     // Auto-arrival: latest breadcrumb inside the destination geofence.
+    //
+    // ACTIVE ONLY. Reaching the destination while an SOS alarm is open must not
+    // auto-complete the trip: that would fire "arrived safely" at the very
+    // contacts who were just alarmed, on nothing more than a GPS fix near a pin.
+    // Someone mid-alarm ends their own trip, deliberately.
     const distanceToDest = haversineMeters(
       latest.lat,
       latest.lng,
       trip.destLat,
       trip.destLng,
     );
-    if (distanceToDest <= AUTO_ARRIVAL_RADIUS_M) {
+    if (
+      trip.status === TripStatus.ACTIVE &&
+      distanceToDest <= AUTO_ARRIVAL_RADIUS_M
+    ) {
       await this.completeTrip(trip, TripStatus.COMPLETED);
       return { accepted: dto.points.length, autoCompleted: true };
     }
@@ -358,13 +401,27 @@ export class TripsService {
     return { accepted: dto.points.length, autoCompleted: false };
   }
 
+  /**
+   * "I've arrived" — ends the journey as COMPLETED. Works from every live state,
+   * SOS included.
+   *
+   * IDEMPOTENT: a trip that has already ended is reported as the success it is,
+   * with the trip exactly as it stands. The arrival geofence auto-completes
+   * trips behind the client's back, and a retry after a dropped response is
+   * normal on a phone — neither is a mistake the traveller can fix, so neither
+   * gets an error. The returned trip carries the real status, so a client that
+   * ends a cancelled trip sees CANCELLED, not a rewritten history.
+   */
   async stopTrip(
     user: AuthenticatedUser,
     tripId: string,
     dto: StopTripDto,
   ): Promise<{ trip: Trip }> {
     const trip = await this.getOwnedTrip(user.id, tripId);
-    this.assertStoppable(trip, 'stop');
+    // Already over: return it untouched. No final point, no presence write —
+    // the user may well have another trip running now, and this dead one must
+    // not touch its state.
+    if (!this.isLive(trip)) return { trip };
 
     // Record the final position when the client provides one.
     if (dto.lat !== undefined && dto.lng !== undefined) {
@@ -385,12 +442,26 @@ export class TripsService {
     return { trip: updated };
   }
 
+  /**
+   * Ends the journey as CANCELLED.
+   *
+   * A TRAVELLER CAN ALWAYS END A JOURNEY THEY STARTED. There is no trip status
+   * that refuses this: SOS cancels (an alarm does not trap you in a trip — the
+   * background GPS is still running and this is the switch that stops it), and a
+   * trip that already ended is a no-op success. The only failure left is a trip
+   * that is not yours or does not exist, which is a 404 telling you so.
+   *
+   * The SOS EVENT IS LEFT OPEN ON PURPOSE. Ending a journey is not the same
+   * statement as "I am safe", and only the traveller may stand an alarm down
+   * (POST /sos/:id/resolve). Closing it here would call people off on the
+   * strength of a Cancel tap.
+   */
   async cancelTrip(
     user: AuthenticatedUser,
     tripId: string,
   ): Promise<{ trip: Trip }> {
     const trip = await this.getOwnedTrip(user.id, tripId);
-    this.assertStoppable(trip, 'cancel');
+    if (!this.isLive(trip)) return { trip };
     const updated = await this.completeTrip(trip, TripStatus.CANCELLED);
     return { trip: updated };
   }
@@ -405,8 +476,11 @@ export class TripsService {
     tripId: string,
   ): Promise<{ ok: true; checkinAt: Date }> {
     const trip = await this.getOwnedTrip(user.id, tripId);
+    if (trip.status === TripStatus.SOS) {
+      throw new ConflictException(CHECKIN_DURING_SOS_MSG);
+    }
     if (trip.status !== TripStatus.ACTIVE) {
-      throw new ConflictException('This trip is not active.');
+      throw new ConflictException(checkinEndedMsg(trip.status));
     }
 
     const checkinAt = new Date();
@@ -437,7 +511,9 @@ export class TripsService {
    */
   async deleteTrip(user: AuthenticatedUser, tripId: string): Promise<void> {
     const trip = await this.getOwnedTrip(user.id, tripId);
-    if (trip.status === TripStatus.ACTIVE) {
+    // Live means live: a trip in SOS was deletable here, which is the worst
+    // possible moment to erase a journey watchers are following.
+    if (this.isLive(trip)) {
       throw new ConflictException(
         'Stop or cancel this trip before deleting it.',
       );
@@ -665,14 +741,6 @@ export class TripsService {
     return trip;
   }
 
-  private assertStoppable(trip: Trip, action: 'stop' | 'cancel'): void {
-    if (trip.status !== TripStatus.ACTIVE && trip.status !== TripStatus.SOS) {
-      throw new ConflictException(
-        `This trip is already ${trip.status.toLowerCase()} — there is nothing to ${action}.`,
-      );
-    }
-  }
-
   /**
    * Shared completion routine (stop, cancel, auto-arrival): sets endedAt +
    * durationS, publishes the status message, and — on COMPLETED only — sends
@@ -688,11 +756,18 @@ export class TripsService {
       Math.floor((endedAt.getTime() - trip.startedAt.getTime()) / 1000),
     );
 
-    // Conditional transition: only the request that actually flips ACTIVE→ended
-    // wins. Guards a double stop, or stop racing an auto-arrival, from
+    // Conditional transition: only the request that actually flips live→ended
+    // wins. Guards a double stop, or a stop racing an auto-arrival, from
     // double-firing the status publish and the safe-arrival push.
+    //
+    // THE SET MUST BE EVERY LIVE STATUS. Scoped to ACTIVE alone (as it was),
+    // ending a trip in SOS matched zero rows: the caller got a cheerful 200 and
+    // the unchanged SOS trip back, while nothing ended — no endedAt, presence
+    // left in Redis, watchers still shown a live journey, and the trip stuck in
+    // SOS for good because every retry no-opped the same way. That is the
+    // "I can't cancel some trips" bug, and it failed silently, which is worse.
     const { count } = await this.prisma.trip.updateMany({
-      where: { id: trip.id, status: TripStatus.ACTIVE },
+      where: { id: trip.id, status: { in: [...LIVE_TRIP_STATUSES] } },
       data: { status, endedAt, durationS },
     });
     const updated = await this.prisma.trip.findUniqueOrThrow({
@@ -728,9 +803,15 @@ export class TripsService {
           const owner = await this.users.findById(trip.userId);
           const ownerName = owner?.name ?? 'Your contact';
           const destination = trip.destLabel ?? 'their destination';
+          // A trip ended out of SOS does NOT get "arrived safely". These are the
+          // exact people who were alarmed minutes ago; the alarm is theirs to
+          // stand down, not ours to imply away with a reassuring push.
+          const endedFromSos = trip.status === TripStatus.SOS;
           await this.notifications.sendToUsers(watcherUserIds, {
-            title: 'Safe arrival',
-            body: `${ownerName} arrived safely at ${destination}.`,
+            title: endedFromSos ? 'Trip ended' : 'Safe arrival',
+            body: endedFromSos
+              ? `${ownerName} ended their trip to ${destination}. There was an SOS alert on this trip — check in on them if you haven't already.`
+              : `${ownerName} arrived safely at ${destination}.`,
             data: { tripId: trip.id },
           });
         }

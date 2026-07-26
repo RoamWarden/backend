@@ -73,6 +73,7 @@ describe('UsersService', () => {
       upsert: jest.Mock;
       deleteMany: jest.Mock;
     };
+    $queryRaw: jest.Mock;
     $transaction: jest.Mock;
   };
   let redisMock: { clearPresence: jest.Mock; incrementCounter: jest.Mock };
@@ -98,6 +99,7 @@ describe('UsersService', () => {
         upsert: jest.fn(),
         deleteMany: jest.fn(),
       },
+      $queryRaw: jest.fn().mockResolvedValue([{ reputation: 0 }]),
       // Runs the callback against the same mock so tx-based code paths work.
       $transaction: jest.fn((cb: (tx: unknown) => unknown) => cb(prismaMock)),
     };
@@ -1116,6 +1118,76 @@ describe('UsersService', () => {
         lastSeenAt: device.lastSeenAt,
       });
       expect(result).not.toHaveProperty('userId');
+    });
+  });
+
+  // ── applyBoundedReputationPenalty ────────────────────────────────────────
+  //
+  // Used today by SOS retraction. The clamp is the interesting part: a penalty
+  // must never push someone below the caller's floor, and — the easy bug — must
+  // never RAISE someone who is already below it.
+
+  describe('applyBoundedReputationPenalty', () => {
+    /** The interpolated values of the tagged-template query, in order. */
+    const queryValues = (mock: jest.Mock): unknown[] => {
+      const [, ...values] = mock.mock.calls[0] as unknown[];
+      return values;
+    };
+    /** The SQL text, whitespace-collapsed, for asserting the clamp shape. */
+    const querySql = (mock: jest.Mock): string => {
+      const [strings] = mock.mock.calls[0] as [string[]];
+      return strings.join('?').replace(/\s+/g, ' ').trim();
+    };
+
+    it('writes the penalty and the floor as bound parameters, never as string SQL', async () => {
+      prismaMock.$queryRaw.mockResolvedValue([{ reputation: -3 }]);
+
+      await service.applyBoundedReputationPenalty('u1', -3, -20);
+
+      expect(queryValues(prismaMock.$queryRaw)).toEqual([-3, -20, 'u1']);
+    });
+
+    it('clamps in ONE statement, and against LEAST(reputation, floor)', async () => {
+      await service.applyBoundedReputationPenalty('u1', -3, -20);
+
+      const sql = querySql(prismaMock.$queryRaw);
+      // One UPDATE — never a read-modify-write, which two concurrent penalties
+      // would race and one would lose.
+      expect(sql).toMatch(/^UPDATE "users"/);
+      expect(sql).toMatch(/GREATEST\(\s*"reputation" \+ \?/);
+      // The inner LEAST is what stops the floor from becoming a free top-up for
+      // anyone already below it.
+      expect(sql).toMatch(/LEAST\("reputation", \?/);
+      expect(sql).toMatch(/RETURNING "reputation"/);
+      expect(prismaMock.$queryRaw).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns the reputation the database ended up with', async () => {
+      prismaMock.$queryRaw.mockResolvedValue([{ reputation: -20 }]);
+      await expect(
+        service.applyBoundedReputationPenalty('u1', -3, -20),
+      ).resolves.toBe(-20);
+    });
+
+    it('returns null (not an error) when the account no longer exists', async () => {
+      prismaMock.$queryRaw.mockResolvedValue([]);
+      await expect(
+        service.applyBoundedReputationPenalty('gone', -3, -20),
+      ).resolves.toBeNull();
+    });
+
+    it('refuses a positive delta — a reward must never ride the floor clamp', async () => {
+      await expect(
+        service.applyBoundedReputationPenalty('u1', 5, -20),
+      ).rejects.toThrow(/must never be used to award reputation/);
+      expect(prismaMock.$queryRaw).not.toHaveBeenCalled();
+    });
+
+    it('surfaces a database failure to the caller rather than reporting a silent success', async () => {
+      prismaMock.$queryRaw.mockRejectedValue(new Error('db down'));
+      await expect(
+        service.applyBoundedReputationPenalty('u1', -3, -20),
+      ).rejects.toThrow('db down');
     });
   });
 

@@ -421,7 +421,27 @@ model SosEvent {
   lng        Float?
   message    String?
   createdAt  DateTime  @default(now()) @map("created_at")
+  /// The traveller said they are SAFE. The SOS happened and stands.
   resolvedAt DateTime? @map("resolved_at")
+
+  // ── retraction (the traveller WITHDREW the alert) ──────────────────────
+  //
+  // Deliberately NOT the same thing as `resolvedAt`. "I'm safe now" closes an
+  // SOS that really happened; "I withdraw this" says it should never have gone
+  // out. Both stop the paging; only one carries a reputation cost, and only one
+  // makes us go back and tell the contacts we already alarmed to stand down.
+  //
+  /// When the traveller withdrew this SOS. NULL = never withdrawn.
+  retractedAt       DateTime? @map("retracted_at")
+  /// Optional free-text reason the traveller gave, forwarded verbatim to the
+  /// contacts who were already reached ("pocket dial", "false alarm, sorry").
+  retractReason     String?   @map("retract_reason")
+  /// RECEIPT for the one-time reputation dent: the penalty actually written to
+  /// `users.reputation` for this retraction. NULL means no dent was applied —
+  /// either this SOS was never retracted, or the reputation write failed and we
+  /// chose not to lie about it. Never used to compute anything; it exists so
+  /// "was this person charged twice?" has an answer.
+  reputationPenalty Int?      @map("reputation_penalty")
 
   user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
   trip       Trip?          @relation(fields: [tripId], references: [id], onDelete: SetNull)
@@ -429,6 +449,9 @@ model SosEvent {
   escalation SosEscalation?
 
   @@index([userId])
+  // Retraction asks "is any OTHER SOS on this trip still live?" before it hands
+  // the trip back to ACTIVE. A foreign key does not index itself in Postgres.
+  @@index([tripId])
   @@map("sos_events")
 }
 

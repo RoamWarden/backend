@@ -1,3 +1,54 @@
+import { TripStatus } from '@prisma/client';
+
+/**
+ * The statuses in which a journey is STILL UNDER WAY.
+ *
+ * SOS IS A LIVE STATE. Raising an alarm does not end a trip — the phone keeps
+ * tracking (the app's `isLiveStatus` says exactly this), watchers keep watching,
+ * and the traveller is more dependent on the trip working, not less. Every
+ * "is this trip still running?" guard must therefore test THIS SET and never
+ * `status === ACTIVE`: an ACTIVE-only guard silently treats a person mid-alarm
+ * as if their journey were already over, which is how ending a trip in SOS
+ * became impossible (see `TripsService.completeTrip`).
+ */
+export const LIVE_TRIP_STATUSES = [TripStatus.ACTIVE, TripStatus.SOS] as const;
+
+/** True while the journey is still running (ACTIVE or SOS). */
+export function isLiveTripStatus(status: TripStatus): boolean {
+  return (LIVE_TRIP_STATUSES as readonly TripStatus[]).includes(status);
+}
+
+/** Shown when a second journey is started while one is still running. */
+export const ACTIVE_TRIP_CONFLICT_MSG =
+  'You already have an active trip — stop or cancel it before starting a new one.';
+
+/**
+ * The same conflict when the running trip is in SOS. Named separately because
+ * "active" would read as a contradiction to someone staring at a red SOS screen,
+ * and the way out is different: end THAT trip (which is allowed) rather than
+ * stand the alarm down.
+ */
+export const SOS_TRIP_CONFLICT_MSG =
+  'You have a trip with an SOS alert on it — end that trip before starting a new one. Cancelling it will not stand the alarm down.';
+
+/**
+ * Refusing a check-in while an alarm is open. Check-in answers an "are you OK?"
+ * nudge; it is NOT how an SOS is stood down, and pretending otherwise would let
+ * someone believe they had called their contacts off when they had not.
+ */
+export const CHECKIN_DURING_SOS_MSG =
+  'There is an SOS alert open on this trip — checking in will not stand it down. Mark yourself safe on the alert instead, or end the trip.';
+
+/** Refusing a check-in on a journey that is over. Says what to do instead. */
+export function checkinEndedMsg(status: TripStatus): string {
+  return `This trip was already ${status.toLowerCase()} — there is nothing to check in on. Start a new trip when you next set off.`;
+}
+
+/** Refusing breadcrumbs for a journey that is over. Says what to do instead. */
+export function pointsRejectedMsg(status: TripStatus): string {
+  return `This trip was already ${status.toLowerCase()} — location updates are only recorded while a trip is running. Start a new trip to share your location again.`;
+}
+
 export const LIVE_VIEW_REPORT_RADIUS_M = 1000;
 export const LIVE_VIEW_REPORT_LIMIT = 200;
 export const TRIP_DETAIL_POINT_LIMIT = 100;

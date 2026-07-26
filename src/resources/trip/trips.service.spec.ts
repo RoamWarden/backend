@@ -16,16 +16,27 @@ import { UsersService } from '../user/users.service';
 import { NotificationsService } from '../notification/notifications.service';
 import { EntitlementsService } from '../../common/entitlements';
 import {
+  ACTIVE_TRIP_CONFLICT_MSG,
+  CHECKIN_DURING_SOS_MSG,
   LIVE_LINK_INVALID_MSG,
+  SOS_TRIP_CONFLICT_MSG,
   TRIP_NOT_FOUND_MSG,
 } from './constant/trips.constants';
 import { channelTripLive } from '../../providers/redis/constant/redis.constants';
 
-const ACTIVE_CONFLICT_MSG =
-  'You already have an active trip — stop or cancel it before starting a new one.';
+const ACTIVE_CONFLICT_MSG = ACTIVE_TRIP_CONFLICT_MSG;
+
+/**
+ * The statuses a trip can be ended from. Spelled out here rather than imported
+ * so the test fails loudly if someone quietly drops SOS from the live set —
+ * that omission is exactly the bug this suite exists to prevent.
+ */
+const LIVE_STATUSES = [TripStatus.ACTIVE, TripStatus.SOS];
 
 /** `expect.any(Date)` typed as Date so it can sit inside typed matcher literals. */
 const ANY_DATE = expect.any(Date) as unknown as Date;
+const ANY_NUMBER = expect.any(Number) as unknown as number;
+const ANY_STRING = expect.any(String) as unknown as string;
 
 type AnyMock = jest.Mock;
 
@@ -208,6 +219,27 @@ describe('TripsService', () => {
       );
       // Short-circuits before touching the transaction.
       expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('blocks a new trip while one is in SOS, with copy that fits an open alarm', async () => {
+      // A trip in SOS is still running — it must occupy the one-live-trip slot.
+      prisma.trip.findFirst.mockResolvedValue({
+        ...baseTrip(),
+        status: TripStatus.SOS,
+      });
+
+      await expect(service.createTrip(owner, dto)).rejects.toThrow(
+        ConflictException,
+      );
+      await expect(service.createTrip(owner, dto)).rejects.toThrow(
+        SOS_TRIP_CONFLICT_MSG,
+      );
+      expect(prisma.trip.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { userId: owner.id, status: { in: LIVE_STATUSES } },
+        }),
+      );
+      expect(txMock.trip.create).not.toHaveBeenCalled();
     });
 
     it('maps a P2002 unique-index violation from the tx to the same 409', async () => {
@@ -583,7 +615,7 @@ describe('TripsService', () => {
   // ── stopTrip / completeTrip ─────────────────────────────────────────────
 
   describe('stopTrip (completeTrip)', () => {
-    it('uses updateMany scoped to the ACTIVE status and, on success, clears presence and notifies watchers', async () => {
+    it('scopes updateMany to EVERY live status and, on success, clears presence and notifies watchers', async () => {
       const trip = baseTrip();
       prisma.trip.findUnique.mockResolvedValueOnce(trip);
       prisma.trip.updateMany.mockResolvedValueOnce({ count: 1 });
@@ -603,7 +635,7 @@ describe('TripsService', () => {
 
       expect(prisma.trip.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 'trip-1', status: TripStatus.ACTIVE },
+          where: { id: 'trip-1', status: { in: LIVE_STATUSES } },
         }),
       );
       expect(result.status).toBe(TripStatus.COMPLETED);
@@ -630,6 +662,150 @@ describe('TripsService', () => {
       expect(redis.publishJson).not.toHaveBeenCalled();
       expect(redis.clearPresence).not.toHaveBeenCalled();
       expect(notifications.sendToUsers).not.toHaveBeenCalled();
+    });
+
+    it('ends a trip that is in SOS, and does NOT tell watchers they arrived safely', async () => {
+      const trip = { ...baseTrip(), status: TripStatus.SOS };
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+      prisma.trip.updateMany.mockResolvedValueOnce({ count: 1 });
+      prisma.trip.findUniqueOrThrow.mockResolvedValueOnce({
+        ...trip,
+        status: TripStatus.COMPLETED,
+        endedAt: new Date(),
+        durationS: 60,
+      });
+      prisma.tripWatcher.findMany.mockResolvedValueOnce([
+        { trip: { userId: owner.id }, contact: { contactUserId: 'w-1' } },
+      ]);
+      users.filterConsentingContactUserIds.mockResolvedValueOnce(['w-1']);
+
+      const { trip: result } = await service.stopTrip(owner, 'trip-1', {});
+
+      expect(result.status).toBe(TripStatus.COMPLETED);
+      const [, message] = notifications.sendToUsers.mock.calls[0] as [
+        string[],
+        { title: string; body: string },
+      ];
+      expect(message.title).toBe('Trip ended');
+      expect(message.body).toContain('SOS alert');
+      expect(message.body).not.toContain('arrived safely');
+    });
+
+    it('is a no-op success on an already-ended trip: no final point, no presence write', async () => {
+      const endedAt = new Date('2026-07-22T09:00:00Z');
+      prisma.trip.findUnique.mockResolvedValueOnce({
+        ...baseTrip(),
+        status: TripStatus.COMPLETED,
+        endedAt,
+        durationS: 3600,
+      });
+
+      const { trip: result } = await service.stopTrip(owner, 'trip-1', {
+        lat: 6.6,
+        lng: 3.4,
+      });
+
+      expect(result.status).toBe(TripStatus.COMPLETED);
+      expect(result.endedAt).toEqual(endedAt);
+      expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+      // No breadcrumb insert and no presence write: the traveller may already
+      // have a NEW trip running, and this dead one must not touch its state.
+      expect(prisma.$executeRaw).not.toHaveBeenCalled();
+      expect(redis.updatePresence).not.toHaveBeenCalled();
+      expect(redis.clearPresence).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── cancelTrip ──────────────────────────────────────────────────────────
+
+  describe('cancelTrip', () => {
+    it('CANCELS A TRIP THAT IS IN SOS — this is the bug: it used to match no rows and report success anyway', async () => {
+      const trip = { ...baseTrip(), status: TripStatus.SOS };
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+      prisma.trip.updateMany.mockResolvedValueOnce({ count: 1 });
+      prisma.trip.findUniqueOrThrow.mockResolvedValueOnce({
+        ...trip,
+        status: TripStatus.CANCELLED,
+        endedAt: new Date(),
+        durationS: 120,
+      });
+
+      const { trip: result } = await service.cancelTrip(owner, 'trip-1');
+
+      expect(prisma.trip.updateMany).toHaveBeenCalledWith({
+        where: { id: 'trip-1', status: { in: LIVE_STATUSES } },
+        data: {
+          status: TripStatus.CANCELLED,
+          endedAt: ANY_DATE,
+          durationS: ANY_NUMBER,
+        },
+      });
+      expect(result.status).toBe(TripStatus.CANCELLED);
+      // Teardown must be identical to an ACTIVE cancel: presence gone, watchers
+      // told the journey is over.
+      expect(redis.clearPresence).toHaveBeenCalledWith(owner.id);
+      expect(redis.publishJson).toHaveBeenCalledWith(
+        channelTripLive('trip-1'),
+        expect.objectContaining({
+          kind: 'status',
+          status: TripStatus.CANCELLED,
+          endedAt: ANY_STRING,
+        }),
+      );
+      // Cancelling is not "I'm safe": no push goes out, and the SOS event is
+      // left for the traveller to stand down themselves.
+      expect(notifications.sendToUsers).not.toHaveBeenCalled();
+    });
+
+    it('cancels an ACTIVE trip and tears tracking down', async () => {
+      const trip = baseTrip();
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+      prisma.trip.updateMany.mockResolvedValueOnce({ count: 1 });
+      prisma.trip.findUniqueOrThrow.mockResolvedValueOnce({
+        ...trip,
+        status: TripStatus.CANCELLED,
+        endedAt: new Date(),
+        durationS: 60,
+      });
+
+      const { trip: result } = await service.cancelTrip(owner, 'trip-1');
+
+      expect(result.status).toBe(TripStatus.CANCELLED);
+      expect(redis.clearPresence).toHaveBeenCalledWith(owner.id);
+    });
+
+    it.each([TripStatus.COMPLETED, TripStatus.CANCELLED])(
+      'is a no-op SUCCESS on a trip that already ended (%s) — never a 409 the traveller cannot act on',
+      async (status) => {
+        const endedAt = new Date('2026-07-22T09:00:00Z');
+        prisma.trip.findUnique.mockResolvedValueOnce({
+          ...baseTrip(),
+          status,
+          endedAt,
+          durationS: 3600,
+        });
+
+        const { trip: result } = await service.cancelTrip(owner, 'trip-1');
+
+        // Reports the truth and rewrites nothing: an arrival stays an arrival.
+        expect(result.status).toBe(status);
+        expect(result.endedAt).toEqual(endedAt);
+        expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+        expect(redis.clearPresence).not.toHaveBeenCalled();
+        expect(redis.publishJson).not.toHaveBeenCalled();
+      },
+    );
+
+    it('404s (not found) when the trip belongs to someone else', async () => {
+      prisma.trip.findUnique.mockResolvedValueOnce({
+        ...baseTrip(),
+        userId: 'someone-else',
+      });
+
+      await expect(service.cancelTrip(owner, 'trip-1')).rejects.toThrow(
+        TRIP_NOT_FOUND_MSG,
+      );
+      expect(prisma.trip.updateMany).not.toHaveBeenCalled();
     });
   });
 
@@ -664,7 +840,7 @@ describe('TripsService', () => {
       expect(result.accepted).toBe(1);
       expect(prisma.trip.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 'trip-1', status: TripStatus.ACTIVE },
+          where: { id: 'trip-1', status: { in: LIVE_STATUSES } },
         }),
       );
     });
@@ -688,6 +864,65 @@ describe('TripsService', () => {
 
       expect(result.autoCompleted).toBe(false);
       expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('accepts breadcrumbs while the trip is in SOS — tracking must not die mid-alarm', async () => {
+      const trip = { ...activeTrip(), status: TripStatus.SOS };
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+
+      const result = await service.addPoints(owner, 'trip-1', {
+        points: [
+          {
+            lat: trip.destLat + 0.1,
+            lng: trip.destLng,
+            recordedAt: new Date('2026-07-22T09:00:00Z'),
+          },
+        ],
+      });
+
+      expect(result.accepted).toBe(1);
+      expect(redis.publishJson).toHaveBeenCalledWith(
+        channelTripLive('trip-1'),
+        expect.objectContaining({ kind: 'position' }),
+      );
+    });
+
+    it('does NOT auto-complete a trip in SOS at the destination (no false "safe arrival")', async () => {
+      const trip = { ...activeTrip(), status: TripStatus.SOS };
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+
+      const result = await service.addPoints(owner, 'trip-1', {
+        points: [
+          {
+            lat: trip.destLat,
+            lng: trip.destLng,
+            recordedAt: new Date('2026-07-22T09:00:00Z'),
+          },
+        ],
+      });
+
+      expect(result.autoCompleted).toBe(false);
+      expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+      expect(notifications.sendToUsers).not.toHaveBeenCalled();
+    });
+
+    it('409s on a trip that already ended, with a sentence that says what to do next', async () => {
+      prisma.trip.findUnique.mockResolvedValue({
+        ...activeTrip(),
+        status: TripStatus.COMPLETED,
+      });
+      const dto = {
+        points: [
+          { lat: 6.5, lng: 3.3, recordedAt: new Date('2026-07-22T09:00:00Z') },
+        ],
+      };
+
+      await expect(service.addPoints(owner, 'trip-1', dto)).rejects.toThrow(
+        ConflictException,
+      );
+      await expect(service.addPoints(owner, 'trip-1', dto)).rejects.toThrow(
+        'Start a new trip to share your location again.',
+      );
     });
   });
 
@@ -715,7 +950,7 @@ describe('TripsService', () => {
       expect(prisma.trip.update).not.toHaveBeenCalled();
     });
 
-    it('409s when the trip is not ACTIVE', async () => {
+    it('409s on a finished trip and says what to do instead', async () => {
       prisma.trip.findUnique.mockResolvedValue({
         ...baseTrip(),
         status: TripStatus.COMPLETED,
@@ -725,7 +960,19 @@ describe('TripsService', () => {
         ConflictException,
       );
       await expect(service.checkin(owner, 'trip-1')).rejects.toThrow(
-        'This trip is not active.',
+        'Start a new trip when you next set off.',
+      );
+      expect(prisma.trip.update).not.toHaveBeenCalled();
+    });
+
+    it('409s during an SOS, saying plainly that a check-in does not stand the alarm down', async () => {
+      prisma.trip.findUnique.mockResolvedValue({
+        ...baseTrip(),
+        status: TripStatus.SOS,
+      });
+
+      await expect(service.checkin(owner, 'trip-1')).rejects.toThrow(
+        CHECKIN_DURING_SOS_MSG,
       );
       expect(prisma.trip.update).not.toHaveBeenCalled();
     });
@@ -779,6 +1026,18 @@ describe('TripsService', () => {
       await expect(service.deleteTrip(owner, 'trip-1')).rejects.toThrow(
         ConflictException,
       );
+      await expect(service.deleteTrip(owner, 'trip-1')).rejects.toThrow(
+        'Stop or cancel this trip before deleting it.',
+      );
+      expect(prisma.trip.delete).not.toHaveBeenCalled();
+    });
+
+    it('409s while the trip is in SOS — a live journey is never deleted out from under its watchers', async () => {
+      prisma.trip.findUnique.mockResolvedValue({
+        ...baseTrip(),
+        status: TripStatus.SOS,
+      });
+
       await expect(service.deleteTrip(owner, 'trip-1')).rejects.toThrow(
         'Stop or cancel this trip before deleting it.',
       );

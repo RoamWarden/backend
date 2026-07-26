@@ -15,14 +15,19 @@ import { TripShareTokenService } from '../auth/trip-share-token.service';
 import { NotificationsService } from '../notification/notifications.service';
 import { UsersService } from '../user/users.service';
 import {
+  CHANNEL_SOS_RETRACTED,
   SOS_ACK_NOT_FOUND_MSG,
   SOS_ESCALATION_ADVANCE_DELAY_MS,
   SOS_ESCALATION_MAX_ATTEMPTS,
   SOS_ESCALATION_MAX_ATTEMPTS_PER_CONTACT,
   SOS_ESCALATION_RETRY_BACKOFF_MS,
   SOS_ESCALATION_ROUND_DELAY_MS,
+  SOS_RETRACTION_ROUND,
+  SOS_RETRACT_ESCALATION_DETAIL,
+  SOS_RETRACT_NOTIFY_FAILED_WARNING,
 } from './constant/sos.constants';
 import { SosEscalationService } from './sos-escalation.service';
+import type { SosRetractedMessage } from './type/sos.types';
 
 /** The shape of a `sosDelivery.create({ data })` call. */
 interface DeliveryCreateArg {
@@ -101,6 +106,7 @@ function makeSosRow(overrides: Record<string, unknown> = {}) {
     lng: 3.3,
     createdAt: RAISED_AT,
     resolvedAt: null,
+    retractedAt: null,
     user: { name: 'Ada' },
     trip: null,
     ...overrides,
@@ -202,6 +208,18 @@ describe('SosEscalationService', () => {
         .mockResolvedValue(capability({ granted: false, enforced: false })),
     };
 
+    // The ladder switch is read ONCE at construction, so every test that wants a
+    // different environment rebuilds the service. The default here arms it, so
+    // the ladder's own behaviour is exercised; the shipping default (off) has
+    // its own describe below.
+    await buildService({ SOS_ESCALATION_ENABLED: 'true' });
+  });
+
+  /**
+   * Boots the service against a given environment. `SOS_ESCALATION_ENABLED` is
+   * unset unless a test says otherwise, which is exactly what production does.
+   */
+  async function buildService(env: Record<string, string> = {}): Promise<void> {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         SosEscalationService,
@@ -211,9 +229,7 @@ describe('SosEscalationService', () => {
           provide: ConfigService,
           useValue: {
             get: jest.fn((key: string) =>
-              key === 'API_BASE_URL'
-                ? 'https://api.roamwarden.test'
-                : undefined,
+              key === 'API_BASE_URL' ? 'https://api.roamwarden.test' : env[key],
             ),
           },
         },
@@ -225,7 +241,7 @@ describe('SosEscalationService', () => {
     }).compile();
 
     service = module.get(SosEscalationService);
-  });
+  }
 
   /** All `sosDelivery.create` data arguments, in call order. */
   function trailRows(): DeliveryCreateArg['data'][] {
@@ -289,8 +305,25 @@ describe('SosEscalationService', () => {
       expect(info.enabled).toBe(false);
       expect(info.reason).toMatch(/Premium/);
       expect(prismaMock.sosEscalation.create).not.toHaveBeenCalled();
-      // Nothing extra is even written for the standard path.
-      expect(prismaMock.sosDelivery.createMany).not.toHaveBeenCalled();
+    });
+
+    it('still records WHO WAS REACHED for a Free user with enforcement ON', async () => {
+      entitlementsMock.checkCapability.mockResolvedValue(
+        capability({ granted: false, enforced: true }),
+      );
+
+      await start();
+
+      // The trail is not a Premium feature. Retraction stands down exactly the
+      // contacts recorded here, so gating it would leave a Free user silently
+      // unable to tell anyone they had withdrawn an alarm.
+      expect(prismaMock.sosDelivery.createMany).toHaveBeenCalledTimes(1);
+      const arg = callArg<{ data: DeliveryCreateArg['data'][] }>(
+        prismaMock.sosDelivery.createMany,
+      );
+      expect(arg.data.map((row) => row.contactUserId)).toEqual(CONTACTS);
+      // …and it is still marked as NOT a priority attempt.
+      expect(arg.data.every((row) => row.priority === false)).toBe(true);
     });
 
     it('arms the ladder for an entitled user when enforcement is ON', async () => {
@@ -319,6 +352,71 @@ describe('SosEscalationService', () => {
       expect(info.enabled).toBe(false);
       expect(info.reason).toMatch(/no linked trusted contacts/i);
       expect(prismaMock.sosEscalation.create).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── the ladder switch (SOS_ESCALATION_ENABLED), default OFF ───────────
+
+  describe('start — SOS_ESCALATION_ENABLED gates the ladder, and is OFF by default', () => {
+    it('arms NO ladder when the flag is unset — nothing can be re-paged', async () => {
+      await buildService();
+
+      const info = await start();
+
+      expect(prismaMock.sosEscalation.create).not.toHaveBeenCalled();
+      expect(info.enabled).toBe(false);
+      expect(info.contactsInLadder).toBe(0);
+      // Descriptive, human, and never "you were not alerted".
+      expect(info.reason).toMatch(/contacts were all alerted immediately/i);
+    });
+
+    it('still alerts and still records EVERY contact on the trail with the ladder off', async () => {
+      await buildService();
+
+      await start();
+
+      // The standard SOS is untouched: the same round-0 trail every user gets,
+      // which is what retraction stands people down from.
+      expect(prismaMock.sosDelivery.createMany).toHaveBeenCalledTimes(1);
+      const arg = callArg<{ data: DeliveryCreateArg['data'][] }>(
+        prismaMock.sosDelivery.createMany,
+      );
+      expect(arg.data.map((row) => row.contactUserId)).toEqual(CONTACTS);
+      expect(arg.data.every((row) => row.round === 0)).toBe(true);
+    });
+
+    it('stays off even for an entitled Premium user — this switch outranks the plan', async () => {
+      await buildService();
+      entitlementsMock.checkCapability.mockResolvedValue(
+        capability({ granted: true, enforced: true }),
+      );
+
+      const info = await start();
+
+      expect(info.enabled).toBe(false);
+      expect(prismaMock.sosEscalation.create).not.toHaveBeenCalled();
+    });
+
+    it('treats anything but an explicit "true" as off', async () => {
+      // Boot validation rejects the typos outright; the parser refuses them too.
+      for (const value of ['false', 'yes', 'no', '1', '']) {
+        prismaMock.sosEscalation.create.mockClear();
+        await buildService({ SOS_ESCALATION_ENABLED: value });
+
+        await start();
+
+        expect(prismaMock.sosEscalation.create).not.toHaveBeenCalled();
+      }
+    });
+
+    it('arms the ladder once the flag is turned on', async () => {
+      await buildService({ SOS_ESCALATION_ENABLED: 'true' });
+
+      const info = await start();
+
+      expect(info.enabled).toBe(true);
+      expect(info.contactsInLadder).toBe(3);
+      expect(prismaMock.sosEscalation.create).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -824,6 +922,368 @@ describe('SosEscalationService', () => {
         new Error('db down'),
       );
       await expect(service.stopOnResolve(SOS_ID)).resolves.toBeUndefined();
+    });
+  });
+
+  // ── retraction ───────────────────────────────────────────────────────
+
+  describe('stopOnRetract', () => {
+    it('closes a RUNNING ladder as STOPPED and says why', async () => {
+      prismaMock.sosEscalation.updateMany.mockResolvedValue({ count: 1 });
+
+      await expect(service.stopOnRetract(SOS_ID)).resolves.toBe(true);
+      const arg = callArg<{
+        where: { sosId: string; status: SosEscalationStatus };
+        data: { status: SosEscalationStatus; detail: string };
+      }>(prismaMock.sosEscalation.updateMany);
+      expect(arg.where).toEqual({
+        sosId: SOS_ID,
+        status: SosEscalationStatus.RUNNING,
+      });
+      expect(arg.data.status).toBe(SosEscalationStatus.STOPPED);
+      expect(arg.data.detail).toBe(SOS_RETRACT_ESCALATION_DETAIL);
+    });
+
+    it('reports false (not an error) when there was no ladder still running', async () => {
+      prismaMock.sosEscalation.updateMany.mockResolvedValue({ count: 0 });
+      await expect(service.stopOnRetract(SOS_ID)).resolves.toBe(false);
+    });
+
+    it('never throws — a failed write must not block a withdrawal', async () => {
+      prismaMock.sosEscalation.updateMany.mockRejectedValue(
+        new Error('db down'),
+      );
+      await expect(service.stopOnRetract(SOS_ID)).resolves.toBe(false);
+    });
+  });
+
+  describe('the sweep honours a retraction even if stopOnRetract failed', () => {
+    it('stops the ladder on the next tick and pages nobody', async () => {
+      prismaMock.sosEvent.findUnique.mockResolvedValue(
+        makeSosRow({ retractedAt: new Date('2026-07-26T09:00:00.000Z') }),
+      );
+
+      await service.tick(makeEscalation({ rank: 0 }));
+
+      // The claim is call 0; the close is the one that carries a status.
+      const close = (
+        prismaMock.sosEscalation.updateMany.mock.calls as [
+          { data: { status?: SosEscalationStatus; detail?: string } },
+        ][]
+      ).find((call) => call[0].data.status !== undefined);
+      expect(close![0].data.status).toBe(SosEscalationStatus.STOPPED);
+      expect(close![0].data.detail).toBe(SOS_RETRACT_ESCALATION_DETAIL);
+      expect(notificationsMock.sendToUsers).not.toHaveBeenCalled();
+      expect(prismaMock.sosDelivery.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('notifyRetraction — standing down the people we alarmed', () => {
+    const RETRACTED_AT = new Date('2026-07-26T09:00:00.000Z');
+
+    const input = (reason?: string) => ({
+      sosId: SOS_ID,
+      userId: USER_ID,
+      ownerName: 'Ada',
+      retractedAt: RETRACTED_AT,
+      ...(reason !== undefined ? { reason } : {}),
+    });
+
+    /** Trail rows as the delivery table would hold them after a fan-out. */
+    function trailRow(
+      contactUserId: string,
+      status: SosDeliveryStatus,
+      rank = 0,
+    ) {
+      return { contactUserId, rank, status };
+    }
+
+    it('tells EXACTLY the contacts the alert actually reached — nobody else', async () => {
+      prismaMock.sosDelivery.findMany.mockResolvedValue([
+        trailRow('contact-a', SosDeliveryStatus.SENT, 0),
+        trailRow('contact-b', SosDeliveryStatus.ACKNOWLEDGED, 1),
+        // Never reached, so never stood down — and it is on the same read, so
+        // the filtering is proved in the code, not assumed from the query.
+        trailRow('contact-c', SosDeliveryStatus.NO_DEVICE, 2),
+      ]);
+
+      const res = await service.notifyRetraction(input());
+
+      // The read is the WHOLE trail: an absent trail and a trail that says
+      // "nobody was reached" are different answers, and only one of them may
+      // fall back to the frozen ladder order.
+      const where = callArg<{ where: { sosId: string } }>(
+        prismaMock.sosDelivery.findMany,
+      ).where;
+      expect(where.sosId).toBe(SOS_ID);
+
+      const calls = notificationsMock.sendToUsers.mock.calls as NotifyCall[];
+      expect(calls).toHaveLength(1);
+      expect(calls[0][0]).toEqual(['contact-a', 'contact-b']);
+      expect(res.notifiedContactCount).toBe(2);
+      expect(res.warning).toBeUndefined();
+    });
+
+    it('counts a contact as reached even if an earlier attempt to them failed', async () => {
+      prismaMock.sosDelivery.findMany.mockResolvedValue([
+        trailRow('contact-a', SosDeliveryStatus.FAILED, 0),
+        trailRow('contact-a', SosDeliveryStatus.SENT, 0),
+      ]);
+
+      const res = await service.notifyRetraction(input());
+
+      const calls = notificationsMock.sendToUsers.mock.calls as NotifyCall[];
+      expect(calls[0][0]).toEqual(['contact-a']);
+      expect(res.notifiedContactCount).toBe(1);
+    });
+
+    it('tells a contact once, however many times we paged them', async () => {
+      prismaMock.sosDelivery.findMany.mockResolvedValue([
+        trailRow('contact-a', SosDeliveryStatus.SENT, 0),
+        trailRow('contact-a', SosDeliveryStatus.SENT, 0),
+        trailRow('contact-a', SosDeliveryStatus.ACKNOWLEDGED, 0),
+      ]);
+
+      const res = await service.notifyRetraction(input());
+
+      const calls = notificationsMock.sendToUsers.mock.calls as NotifyCall[];
+      expect(calls[0][0]).toEqual(['contact-a']);
+      expect(res.notifiedContactCount).toBe(1);
+    });
+
+    it('does not tell people who were never reached (no device, failed, skipped)', async () => {
+      prismaMock.sosDelivery.findMany.mockResolvedValue([
+        trailRow('contact-a', SosDeliveryStatus.NO_DEVICE, 0),
+        trailRow('contact-b', SosDeliveryStatus.FAILED, 1),
+        trailRow('contact-c', SosDeliveryStatus.SKIPPED, 2),
+      ]);
+      // A ladder row exists, and must NOT be used: the trail spoke, and what it
+      // said was "nobody heard it". These people were never alarmed.
+      prismaMock.sosEscalation.findUnique.mockResolvedValue({
+        contactOrder: [...CONTACTS],
+      });
+
+      const res = await service.notifyRetraction(input());
+
+      expect(notificationsMock.sendToUsers).not.toHaveBeenCalled();
+      expect(prismaMock.sosDelivery.createMany).not.toHaveBeenCalled();
+      expect(res.notifiedContactCount).toBe(0);
+      expect(res.warning).toBeUndefined();
+    });
+
+    // ── an ABSENT trail is "we don't know", never "nobody" ────────────────
+    //
+    // `recordBroadcast` is best-effort and runs AFTER `SosService.raise` has
+    // already pushed the alert, so a database blip at raise time leaves
+    // contacts holding a 🆘 with no rows to show for it. Standing nobody down
+    // there — while telling the traveller there was nobody to stand down — is
+    // the exact harm retraction exists to prevent.
+
+    it('falls back to the frozen ladder order when the trail is SILENT', async () => {
+      prismaMock.sosDelivery.findMany.mockResolvedValue([]);
+      prismaMock.sosEscalation.findUnique.mockResolvedValue({
+        contactOrder: [...CONTACTS],
+      });
+
+      const res = await service.notifyRetraction(input());
+
+      const calls = notificationsMock.sendToUsers.mock.calls as NotifyCall[];
+      expect(calls).toHaveLength(1);
+      expect(calls[0][0]).toEqual(CONTACTS);
+      expect(res.notifiedContactCount).toBe(3);
+      expect(res.warning).toBeUndefined();
+      // The stand-down is recorded for them too, at their ladder rank.
+      const rows = callArg<{ data: DeliveryCreateArg['data'][] }>(
+        prismaMock.sosDelivery.createMany,
+      ).data;
+      expect(rows.map((row) => row.contactUserId)).toEqual(CONTACTS);
+      expect(rows.map((row) => row.rank)).toEqual([0, 1, 2]);
+    });
+
+    it('reports nobody only when NEITHER the trail nor the ladder knows anyone', async () => {
+      prismaMock.sosDelivery.findMany.mockResolvedValue([]);
+      prismaMock.sosEscalation.findUnique.mockResolvedValue(null);
+
+      const res = await service.notifyRetraction(input());
+
+      expect(notificationsMock.sendToUsers).not.toHaveBeenCalled();
+      expect(res.notifiedContactCount).toBe(0);
+      expect(res.warning).toBeUndefined();
+    });
+
+    it('never throws when the ladder fallback read itself fails', async () => {
+      prismaMock.sosDelivery.findMany.mockResolvedValue([]);
+      prismaMock.sosEscalation.findUnique.mockRejectedValue(
+        new Error('db down'),
+      );
+
+      await expect(service.notifyRetraction(input())).resolves.toEqual({
+        notifiedContactCount: 0,
+      });
+      expect(notificationsMock.sendToUsers).not.toHaveBeenCalled();
+    });
+
+    it('is honest and useful in the push copy', async () => {
+      prismaMock.sosDelivery.findMany.mockResolvedValue([
+        trailRow('contact-a', SosDeliveryStatus.SENT),
+      ]);
+
+      await service.notifyRetraction(input('Pocket dial, sorry!'));
+
+      const [, msg] = (
+        notificationsMock.sendToUsers.mock.calls as NotifyCall[]
+      )[0];
+      expect(msg.title).toMatch(/Ada has withdrawn their SOS/);
+      expect(msg.body).toMatch(/no longer need help/);
+      expect(msg.body).toMatch(/stand down/i);
+      expect(msg.body).toMatch(/Pocket dial, sorry!/);
+      // It withdraws an alert to the traveller's OWN contacts, and says so.
+      expect(msg.body).toMatch(/RoamWarden only alerts trusted contacts/);
+      expect(msg.body).toMatch(/if you called emergency services/i);
+      expect(msg.data?.sosId).toBe(SOS_ID);
+      expect(msg.data?.retracted).toBe('true');
+    });
+
+    it('carries no location, trip or share link — a withdrawal is not a re-delivery', async () => {
+      prismaMock.sosDelivery.findMany.mockResolvedValue([
+        trailRow('contact-a', SosDeliveryStatus.SENT),
+      ]);
+
+      await service.notifyRetraction(input());
+
+      const [, msg] = (
+        notificationsMock.sendToUsers.mock.calls as NotifyCall[]
+      )[0];
+      expect(msg.data).toEqual({ sosId: SOS_ID, retracted: 'true' });
+      const published = (
+        redisMock.publishJson.mock.calls as Array<[string, SosRetractedMessage]>
+      ).find(([channel]) => channel === CHANNEL_SOS_RETRACTED);
+      expect(published).toBeDefined();
+      expect(published![1]).toEqual({
+        sosId: SOS_ID,
+        user: { id: USER_ID, name: 'Ada' },
+        retractedAt: RETRACTED_AT.toISOString(),
+        contactUserIds: ['contact-a'],
+      });
+    });
+
+    it('NEVER publishes a retraction on CHANNEL_SOS — that channel re-raises alarms', async () => {
+      prismaMock.sosDelivery.findMany.mockResolvedValue([
+        trailRow('contact-a', SosDeliveryStatus.SENT),
+      ]);
+
+      await service.notifyRetraction(input());
+
+      expect(
+        redisMock.publishJson.mock.calls.some(
+          ([channel]) => channel === CHANNEL_SOS,
+        ),
+      ).toBe(false);
+    });
+
+    it('writes the stand-down onto the trail at the retraction round', async () => {
+      prismaMock.sosDelivery.findMany.mockResolvedValue([
+        trailRow('contact-a', SosDeliveryStatus.SENT, 0),
+        trailRow('contact-b', SosDeliveryStatus.SENT, 2),
+      ]);
+      prismaMock.deviceToken.findMany.mockResolvedValue([
+        { userId: 'contact-a' },
+      ]);
+
+      await service.notifyRetraction(input());
+
+      const rows = callArg<{ data: DeliveryCreateArg['data'][] }>(
+        prismaMock.sosDelivery.createMany,
+      ).data;
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toMatchObject({
+        sosId: SOS_ID,
+        contactUserId: 'contact-a',
+        rank: 0,
+        round: SOS_RETRACTION_ROUND,
+        status: SosDeliveryStatus.SENT,
+        channel: SosDeliveryChannel.PUSH,
+        priority: false,
+      });
+      // Honest about someone who has since unregistered every device.
+      expect(rows[1]).toMatchObject({
+        contactUserId: 'contact-b',
+        rank: 2,
+        status: SosDeliveryStatus.NO_DEVICE,
+      });
+      expect(SOS_RETRACTION_ROUND).toBeLessThan(0);
+    });
+
+    it('WARNS when it cannot work out who was reached — nobody may be left worrying quietly', async () => {
+      prismaMock.sosDelivery.findMany.mockRejectedValue(new Error('db down'));
+
+      const res = await service.notifyRetraction(input());
+
+      expect(res.notifiedContactCount).toBe(0);
+      expect(res.warning).toBe(SOS_RETRACT_NOTIFY_FAILED_WARNING);
+      expect(notificationsMock.sendToUsers).not.toHaveBeenCalled();
+    });
+
+    it('WARNS when the push itself blows up', async () => {
+      prismaMock.sosDelivery.findMany.mockResolvedValue([
+        trailRow('contact-a', SosDeliveryStatus.SENT),
+      ]);
+      notificationsMock.sendToUsers.mockRejectedValue(new Error('fcm down'));
+
+      const res = await service.notifyRetraction(input());
+
+      expect(res.notifiedContactCount).toBe(0);
+      expect(res.warning).toBe(SOS_RETRACT_NOTIFY_FAILED_WARNING);
+    });
+
+    it('never throws, even when the audit write fails', async () => {
+      prismaMock.sosDelivery.findMany.mockResolvedValue([
+        trailRow('contact-a', SosDeliveryStatus.SENT),
+      ]);
+      prismaMock.sosDelivery.createMany.mockRejectedValue(new Error('db down'));
+
+      await expect(service.notifyRetraction(input())).resolves.toEqual({
+        notifiedContactCount: 1,
+      });
+    });
+
+    it('does not re-check consent — the correction must reach whoever got the alarm', async () => {
+      prismaMock.sosDelivery.findMany.mockResolvedValue([
+        trailRow('contact-a', SosDeliveryStatus.SENT),
+      ]);
+      // Even if this contact has since unlinked, they were already alarmed.
+      usersMock.filterConsentingContactUserIds.mockResolvedValue([]);
+
+      const res = await service.notifyRetraction(input());
+
+      expect(res.notifiedContactCount).toBe(1);
+      const calls = notificationsMock.sendToUsers.mock.calls as NotifyCall[];
+      expect(calls[0][0]).toEqual(['contact-a']);
+    });
+  });
+
+  describe('getTrail — retraction', () => {
+    it('surfaces the withdrawal and its reason alongside the attempts', async () => {
+      const retractedAt = new Date('2026-07-26T09:00:00.000Z');
+      const view = await service.getTrail({
+        id: SOS_ID,
+        createdAt: RAISED_AT,
+        resolvedAt: null,
+        retractedAt,
+        retractReason: 'Pocket dial',
+      });
+      expect(view.retractedAt).toBe(retractedAt.toISOString());
+      expect(view.retractReason).toBe('Pocket dial');
+    });
+
+    it('reports null for an SOS that was never withdrawn', async () => {
+      const view = await service.getTrail({
+        id: SOS_ID,
+        createdAt: RAISED_AT,
+        resolvedAt: null,
+      });
+      expect(view.retractedAt).toBeNull();
+      expect(view.retractReason).toBeNull();
     });
   });
 
