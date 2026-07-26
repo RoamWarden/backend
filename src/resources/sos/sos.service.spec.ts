@@ -85,10 +85,10 @@ function makeTrip(overrides: Partial<Record<string, unknown>> = {}) {
 describe('SosService', () => {
   let service: SosService;
 
-  // Prisma: sosEvent CRUD, trip.findUnique/update, $transaction runs cb(tx).
+  // Prisma: sosEvent CRUD, trip.findUnique/updateMany, $transaction runs cb(tx).
   let txMock: {
     sosEvent: { create: jest.Mock };
-    trip: { update: jest.Mock };
+    trip: { updateMany: jest.Mock };
   };
   let prismaMock: {
     trip: { findUnique: jest.Mock; updateMany: jest.Mock };
@@ -139,7 +139,8 @@ describe('SosService', () => {
           createdAt: CREATED_AT,
         }),
       },
-      trip: { update: jest.fn().mockResolvedValue({}) },
+      // Guarded ACTIVE -> SOS transition: won by default.
+      trip: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
     };
     prismaMock = {
       trip: {
@@ -413,12 +414,28 @@ describe('SosService', () => {
       ]);
     });
 
-    it('flips the active trip to SOS status inside the transaction', async () => {
+    it('flips the active trip to SOS status inside the transaction, guarded on ACTIVE', async () => {
       await service.raise(USER, {});
-      expect(txMock.trip.update).toHaveBeenCalledWith({
-        where: { id: 'trip-1' },
+      expect(txMock.trip.updateMany).toHaveBeenCalledWith({
+        where: { id: 'trip-1', status: TripStatus.ACTIVE },
         data: { status: TripStatus.SOS },
       });
+    });
+
+    it('does not publish SOS on the trip when the guarded flip lost the race', async () => {
+      // The monitor's auto-close (or a stop from another device) ended the trip
+      // between the read and the write. The alarm still goes out — only the
+      // trip-status publish is suppressed, because nothing changed.
+      txMock.trip.updateMany.mockResolvedValue({ count: 0 });
+      const res = await service.raise(USER, {});
+      expect(res.sosId).toBe('sos-1');
+      expect(txMock.sosEvent.create).toHaveBeenCalledTimes(1);
+      expect(notificationsMock.sendToUsers).toHaveBeenCalled();
+      expect(
+        redisMock.publishJson.mock.calls.some(
+          ([channel]) => channel === channelTripLive('trip-1'),
+        ),
+      ).toBe(false);
     });
 
     it("publishes a status message on the trip's live channel", async () => {
@@ -462,7 +479,7 @@ describe('SosService', () => {
         makeTrip({ status: TripStatus.COMPLETED }),
       );
       await service.raise(USER, {});
-      expect(txMock.trip.update).not.toHaveBeenCalled();
+      expect(txMock.trip.updateMany).not.toHaveBeenCalled();
       expect(
         redisMock.publishJson.mock.calls.some(
           ([channel]) => channel === channelTripLive('trip-1'),

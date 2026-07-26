@@ -18,8 +18,12 @@ import { TripsService } from './trips.service';
 
 /**
  * No-arrival / stall escalation (build plan §6, §13#4). A once-a-minute sweep
- * walks every ACTIVE trip and runs a two-stage escalation ladder:
+ * walks every ACTIVE trip and runs an escalation ladder:
  *
+ *  0. FIRST, the opposite question: has this silent trip already arrived? A
+ *     stored breadcrumb inside the destination geofence closes it as COMPLETED
+ *     before any of the rungs below can raise an alarm about a finished
+ *     journey. See `TripsService.completeIfArrived`.
  *  1. The trip is overdue (past its expected arrival + grace) OR has stalled
  *     (no fresh breadcrumb on a trip that was clearly moving) → nudge the
  *     traveller with an "Are you OK?" push and flag the live view `overdue`.
@@ -120,6 +124,23 @@ export class TripMonitorService {
       trip.lastPointAt !== null &&
       now - trip.lastPointAt.getTime() > TRIP_STALL_TIMEOUT_S * 1000 &&
       now - trip.startedAt.getTime() > TRIP_STALL_MIN_ACTIVE_S * 1000;
+
+    // ── STAGE 0: they got there, we just never noticed it live ──────────
+    //
+    // Runs BEFORE the ladder on purpose. A trip whose STORED breadcrumbs put the
+    // traveller inside the destination geofence is not a trip in trouble, and
+    // the ladder would tell them so three times over: "Are you OK?", then their
+    // contacts "may need help", then the journey filed as CANCELLED six hours
+    // later. Closing it as COMPLETED is the honest answer, and the one that
+    // unblocks the next trip (ACTIVE_TRIP_CONFLICT_MSG).
+    //
+    // Gated on `stalled`, so the spatial lookup only runs for trips already 20
+    // minutes silent: a journey still sending its location is never touched and
+    // the query stays off the sweep's hot path. `completeIfArrived` re-reads the
+    // trip, refuses anything not ACTIVE (an open SOS is never closed behind the
+    // traveller), and returns true only when IT made the change — so a real stop
+    // that won the race is neither announced nor skipped over here.
+    if (stalled && (await this.trips.completeIfArrived(trip.id))) return;
 
     // ── STAGE 1: nudge the traveller ────────────────────────────────────
     if (

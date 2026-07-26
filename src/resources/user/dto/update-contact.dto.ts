@@ -1,4 +1,5 @@
 import {
+  IsBoolean,
   IsEmail,
   IsNotEmpty,
   IsOptional,
@@ -46,4 +47,13 @@ export class UpdateContactDto {
   @IsString({ message: 'relation must be a string.' })
   @MaxLength(60, { message: 'relation must be 60 characters or fewer.' })
   relation?: string | null;
+
+  /**
+   * Pins this contact to the top of the caller's own list. A display preference
+   * only — it grants no extra reach and changes nothing about who is notified.
+   * Not nullable: the column has no "unset" state, so un-favouriting is `false`.
+   */
+  @IsOptional()
+  @IsBoolean({ message: 'favorite must be true or false.' })
+  favorite?: boolean;
 }

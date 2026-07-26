@@ -344,9 +344,10 @@ export class TripsService {
 
     await this.insertPoints(tripId, dto.points);
 
-    const latest = [...dto.points].sort(
+    const ordered = [...dto.points].sort(
       (a, b) => a.recordedAt.getTime() - b.recordedAt.getTime(),
-    )[dto.points.length - 1];
+    );
+    const latest = ordered[ordered.length - 1];
 
     // Track the freshest breadcrumb so the stall detector (trip-monitor cron)
     // can tell a moving trip from one that has gone silent. Clamp future
@@ -379,24 +380,48 @@ export class TripsService {
       },
     });
 
-    // Auto-arrival: latest breadcrumb inside the destination geofence.
+    // Auto-arrival: ANY breadcrumb in this batch inside the destination
+    // geofence — not just the newest one.
+    //
+    // Testing only the tail missed real arrivals, which is the "my trip ended
+    // when I got there but the app still says it's live" report. The client
+    // batches hard on purpose (25m distance filter, deferred flush every ~60s
+    // or ~150m, plus the whole retry queue prepended), so one upload routinely
+    // spans a kilometre of driving. A car crosses a 150m circle between two
+    // fixes we do look at; park round the corner and the tail lands outside it,
+    // the arrival was never noticed, and the row stays ACTIVE until the monitor
+    // gives up hours later and files it as CANCELLED.
+    //
+    // `.find`, not `.some`: the EARLIEST qualifying fix is the moment they
+    // arrived, which keeps the semantics identical to the old tail check on a
+    // single-point batch. O(n) haversine over at most TRIP_POINTS_MAX_BATCH.
     //
     // ACTIVE ONLY. Reaching the destination while an SOS alarm is open must not
     // auto-complete the trip: that would fire "arrived safely" at the very
     // contacts who were just alarmed, on nothing more than a GPS fix near a pin.
     // Someone mid-alarm ends their own trip, deliberately.
-    const distanceToDest = haversineMeters(
-      latest.lat,
-      latest.lng,
-      trip.destLat,
-      trip.destLng,
+    const arrival = ordered.find(
+      (p) =>
+        haversineMeters(p.lat, p.lng, trip.destLat, trip.destLng) <=
+        AUTO_ARRIVAL_RADIUS_M,
     );
-    if (
-      trip.status === TripStatus.ACTIVE &&
-      distanceToDest <= AUTO_ARRIVAL_RADIUS_M
-    ) {
-      await this.completeTrip(trip, TripStatus.COMPLETED);
-      return { accepted: dto.points.length, autoCompleted: true };
+    if (trip.status === TripStatus.ACTIVE && arrival !== undefined) {
+      // `[ACTIVE]`, so an SOS raised between the read above and this write wins
+      // — the row refuses the transition instead of the alarm being closed with
+      // an "arrived safely" push.
+      const { trip: after, changed } = await this.completeTrip(
+        trip,
+        TripStatus.COMPLETED,
+        [TripStatus.ACTIVE],
+      );
+      // Tell the client to stop only if the journey really is over: `changed`
+      // (we ended it) or already ended by someone else. A trip left LIVE by a
+      // late SOS must keep uploading — the app tears its GPS task down on
+      // `autoCompleted`, and that is the worst possible moment to lose the feed.
+      return {
+        accepted: dto.points.length,
+        autoCompleted: changed || !this.isLive(after),
+      };
     }
 
     return { accepted: dto.points.length, autoCompleted: false };
@@ -487,7 +512,9 @@ export class TripsService {
    *
    * ACTIVE-ONLY by design: an SOS trip is never closed behind the traveller's
    * back. (The sweep only selects ACTIVE, but the guard is restated here so the
-   * rule survives a change of caller.)
+   * rule survives a change of caller.) The read below is not enough on its own —
+   * an alarm raised between it and the write would still be cancelled — so the
+   * allowed set is handed to `completeTrip` and enforced by the row itself.
    *
    * Routed through the shared `completeTrip` so endedAt/durationS, the presence
    * clear and the `trip:status` publish all happen exactly once, under the same
@@ -504,8 +531,76 @@ export class TripsService {
     const { trip: updated, changed } = await this.completeTrip(
       trip,
       TripStatus.CANCELLED,
+      [TripStatus.ACTIVE],
     );
     return changed ? updated : null;
+  }
+
+  /**
+   * Close a stalled trip as COMPLETED **if a breadcrumb we already stored proves
+   * the traveller reached the destination**. Only `TripMonitorService` calls it,
+   * and only for a trip whose feed has already gone silent.
+   *
+   * THIS INVENTS NO POLICY. It applies the exact rule `addPoints` applies live —
+   * "a recorded fix within AUTO_ARRIVAL_RADIUS_M of the destination is an
+   * arrival" — to points that reached the database without that rule ever being
+   * run against them. Two ways that happens, both real:
+   *   · a client shipped before the batch-wide check above, whose arrival fix
+   *     sat in the middle of an upload and was never tested. Those rows are
+   *     ACTIVE in the database right now — this is what repairs them.
+   *   · the arrival landed while the trip was in SOS (auto-arrival is ACTIVE-only
+   *     by design) and the alarm was resolved back to ACTIVE afterwards.
+   *
+   * It cannot be more wrong than the live geofence, because it IS the live
+   * geofence — a pass-through that would have auto-completed the trip on arrival
+   * gets the same answer here, just later.
+   *
+   * Called only for a stalled trip, so a journey still sending its location is
+   * never ended out from under the traveller, and the spatial query stays off
+   * the hot path. ACTIVE-only for the same reason `autoCloseTrip` is: an open
+   * alarm is never stood down behind someone's back.
+   *
+   * @returns true only if THIS call ended the trip — the caller must not
+   *   announce, or skip its own ladder on, a close it did not make.
+   */
+  async completeIfArrived(tripId: string): Promise<boolean> {
+    const trip = await this.prisma.trip.findUnique({ where: { id: tripId } });
+    if (!trip || trip.status !== TripStatus.ACTIVE) return false;
+
+    let arrived = false;
+    try {
+      // Indexed by trip_points_geog_gix (GiST); LIMIT 1 so it stops at the
+      // first hit rather than scanning a whole journey's breadcrumbs.
+      const rows = await this.prisma.$queryRaw<{ hit: number }[]>(
+        Prisma.sql`
+          SELECT 1 AS hit
+            FROM trip_points
+           WHERE trip_id = ${tripId}::uuid
+             AND ST_DWithin(
+                   geog,
+                   ST_GeogFromText(${toWktPoint(trip.destLat, trip.destLng)}),
+                   ${AUTO_ARRIVAL_RADIUS_M}
+                 )
+           LIMIT 1`,
+      );
+      arrived = rows.length > 0;
+    } catch (err) {
+      // A failed lookup means "we don't know", never "they didn't arrive". The
+      // sweep's own ladder still runs and this retries next minute.
+      this.logger.error(
+        `Failed to check recorded arrival for trip ${tripId}`,
+        err instanceof Error ? err.stack : String(err),
+      );
+      return false;
+    }
+    if (!arrived) return false;
+
+    // `[ACTIVE]` for the same reason `autoCloseTrip` passes it: the status check
+    // above is a read, and the spatial query between them is not instant.
+    const { changed } = await this.completeTrip(trip, TripStatus.COMPLETED, [
+      TripStatus.ACTIVE,
+    ]);
+    return changed;
   }
 
   /**
@@ -830,10 +925,21 @@ export class TripsService {
    * Shared completion routine (stop, cancel, auto-arrival): sets endedAt +
    * durationS, publishes the status message, and — on COMPLETED only — sends
    * the safe-arrival push to linked watchers.
+   *
+   * @param expectStatuses the statuses this close is allowed to act on. Defaults
+   *   to every live status (a deliberate stop/cancel ends the journey whatever
+   *   state it is in). The ACTIVE-ONLY callers — auto-arrival, `autoCloseTrip`,
+   *   `completeIfArrived` — pass `[ACTIVE]`, because their own `status ===
+   *   ACTIVE` check is a READ, and an alarm raised between that read and this
+   *   write would otherwise be closed behind the traveller's back: presence
+   *   cleared, watchers told CANCELLED, and "we closed your trip" pushed at the
+   *   people who were alarmed seconds earlier. Passing it here makes the rule
+   *   atomic — the row itself refuses the transition — rather than advisory.
    */
   private async completeTrip(
     trip: Trip,
     status: typeof TripStatus.COMPLETED | typeof TripStatus.CANCELLED,
+    expectStatuses: readonly TripStatus[] = LIVE_TRIP_STATUSES,
   ): Promise<{ trip: Trip; changed: boolean }> {
     const endedAt = new Date();
     const durationS = Math.max(
@@ -845,14 +951,16 @@ export class TripsService {
     // wins. Guards a double stop, or a stop racing an auto-arrival, from
     // double-firing the status publish and the safe-arrival push.
     //
-    // THE SET MUST BE EVERY LIVE STATUS. Scoped to ACTIVE alone (as it was),
-    // ending a trip in SOS matched zero rows: the caller got a cheerful 200 and
-    // the unchanged SOS trip back, while nothing ended — no endedAt, presence
-    // left in Redis, watchers still shown a live journey, and the trip stuck in
-    // SOS for good because every retry no-opped the same way. That is the
-    // "I can't cancel some trips" bug, and it failed silently, which is worse.
+    // THE DEFAULT SET MUST BE EVERY LIVE STATUS. Scoped to ACTIVE alone (as it
+    // was), ending a trip in SOS matched zero rows: the caller got a cheerful
+    // 200 and the unchanged SOS trip back, while nothing ended — no endedAt,
+    // presence left in Redis, watchers still shown a live journey, and the trip
+    // stuck in SOS for good because every retry no-opped the same way. That is
+    // the "I can't cancel some trips" bug, and it failed silently, which is
+    // worse. `expectStatuses` narrows it ONLY for the automatic closes, which
+    // must never touch an alarm — see the doc block.
     const { count } = await this.prisma.trip.updateMany({
-      where: { id: trip.id, status: { in: [...LIVE_TRIP_STATUSES] } },
+      where: { id: trip.id, status: { in: [...expectStatuses] } },
       data: { status, endedAt, durationS },
     });
     const updated = await this.prisma.trip.findUniqueOrThrow({

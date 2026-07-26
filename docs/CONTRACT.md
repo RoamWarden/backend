@@ -163,14 +163,117 @@ class UsersService {
 
 REST: `GET /me` (profile + reputation), `PATCH /me { name?, phone?, avatarUrl? }`,
 `DELETE /me` (full cascade delete — GDPR), `GET/POST/PATCH/DELETE /me/contacts(/:id)`,
-`POST /me/contacts/lookup`, `POST /me/devices { token, platform: 'IOS'|'ANDROID' }`,
+`GET /me/contacts/page`, `POST /me/contacts/lookup`,
+`GET/POST /me/contact-groups`, `PATCH/DELETE /me/contact-groups/:id`,
+`POST /me/devices { token, platform: 'IOS'|'ANDROID' }`,
 `DELETE /me/devices/:token`.
 Contact create body: `{ name, phone?, email?, contactUserId?, relation? }`.
+Contact patch body: the same fields (nullable ones accept `null` to clear) plus
+`favorite?: boolean`.
 
 A trusted contact is either DETAILS-ONLY (name + phone/email you keep so you can
 reach them yourself — RoamWarden sends them nothing) or LINKED (`contactUserId`
 set), which is what enables in-app trip + SOS alerts. `contactUserId` must come
 from the lookup below; users never type or paste it.
+
+`favorite` is a per-contact DISPLAY preference and nothing else. It pins the
+person to the top of the owner's own list; it grants no extra reach, no priority
+in an SOS fan-out, and no consent. Un-favouriting is `favorite: false`, not
+`null` — the column has no unset state.
+
+#### Two contact listings, on purpose
+
+| Route | Shape | Paged? | Search? |
+| --- | --- | --- | --- |
+| `GET /me/contacts` | flat array `ContactWithLinkedUser[]` | **no — deliberately** | no |
+| `GET /me/contacts/page` | `{ data, page, limit, total }` | yes | yes (`q`) |
+
+**`GET /me/contacts` is deliberately unpaginated and its shape is frozen.**
+TestFlight builds already in users' hands call it and index straight into the
+array, so wrapping it in an envelope would break them in the field, on the
+screen that arms the SOS feature. New fields may be ADDED to each item — that
+is exactly how `favorite` shipped — but the envelope never changes and no query
+parameter alters it. `GET /me/contacts/page` is the paged one, a separate route
+rather than a flag on the old one so no client can accidentally opt in.
+
+#### Paged + searchable contacts — `GET /me/contacts/page`
+
+Query: `?q=&page=&limit=` — all optional. `page` defaults to 1, `limit` to 10
+and is capped at 50 (the response echoes the CAPPED value, so a client that
+asked for 500 and got 50 rows does not conclude it has hit the end of the list).
+
+```ts
+{ data: ContactWithLinkedUser[]; page: number; limit: number; total: number }
+```
+
+`data` items are byte-for-byte the objects `GET /me/contacts` returns, so a
+client needs one mapper for both. `total` is the size of the whole filtered set,
+not of this page; it and the page come from one transaction so they cannot
+disagree about a row added mid-request.
+
+`q` is a case-insensitive PARTIAL match across `name` **or** `email` **or**
+`phone` — people search their own list with whichever of the three they
+remember, including the last four digits of a number. Partial matching is safe
+here and only here: the query is anchored on the caller's `userId`, so it can
+only ever search rows they already own. `POST /me/contacts/lookup` stays exact
+-match for precisely the reason this one need not be.
+
+Ordering is favourites first, then name A-Z, then `id`. The trailing `id` is
+load-bearing, not decoration: without a total order, two contacts with the same
+name have no defined relative position and `skip`/`take` can show one row twice
+and another never.
+
+#### Contact groups — `/me/contact-groups`
+
+A contact group is the owner's PRIVATE label over contacts they already have
+("Family", "Work"). It is **not** the family-plan group under `/groups`: nobody
+joins one, nobody is invited to one, nobody is notified because of one, and no
+other account can see or address one. Grouping therefore grants no reach
+whatsoever — every fan-out still passes through
+`UsersService.filterConsentingContactUserIds`. Not gated by any plan.
+
+```ts
+interface ContactGroupView {
+  id: string;
+  name: string;
+  favorite: boolean;
+  /** = contactIds.length; shipped so a list row can render "4 people". */
+  memberCount: number;
+  contactIds: string[];
+  createdAt: Date;
+}
+```
+
+| Route | Body | Returns |
+| --- | --- | --- |
+| `GET /me/contact-groups?q=` | — | `ContactGroupView[]` (favourites first, then name) |
+| `POST /me/contact-groups` | `{ name, contactIds?, favorite? }` | the created `ContactGroupView` |
+| `PATCH /me/contact-groups/:id` | `{ name?, favorite?, contactIds? }` | the updated `ContactGroupView` |
+| `DELETE /me/contact-groups/:id` | — | 204 |
+
+`q` on the list is a case-insensitive partial match on the group NAME. The list
+is deliberately unpaginated: groups are labels a person types by hand.
+
+`name` is required on create, trimmed before validation (so `"   "` is a 400,
+not a group called three spaces) and 1–60 characters.
+
+**`contactIds` on PATCH: present REPLACES the whole membership, absent leaves it
+alone.** `[]` empties the group; three ids leave exactly those three. That
+distinction is what lets the app send a rename on its own without re-sending —
+and risking truncating — a roster it may not have loaded.
+
+**Deleting a group NEVER deletes the contacts in it.** The cascade runs from
+`contact_groups` to `contact_group_members` and stops. A folder is not its
+contents, and losing a trusted contact to a tidy-up would be a safety bug.
+
+Failures (`message` is always human and safe to show verbatim):
+
+| Status | When |
+| --- | --- |
+| 400 | `name` missing / blank / >60 chars, a `contactIds` entry that is not a UUID, an unknown property. |
+| 400 | One or more `contactIds` are not the caller's contacts: *"These contact ids are not in your trusted contacts: …. Remove them or add the contacts first."* — the same check and wording `createTrip` applies to `watcherContactIds`. A contact on another account is indistinguishable from a deleted one here, so this never confirms an id exists. |
+| 404 | Unknown group id — **including another user's real group id**. Every group route is scoped to the caller with `{ id, userId }`, and a miss is a 404 with the ordinary not-found message, never a 403 that would confirm the id exists. |
+| 409 | A group of that name already exists for this user: *"You already have a contact group called "Family". Pick a different name, or edit that group instead."* Matched case-insensitively (two "Family" groups in a picker is a bug) and the message quotes the STORED name, so someone who typed "family" can see what it clashed with. `UNIQUE(user_id, name)` backs it up for the concurrent case. |
 
 #### Contact lookup by email — `POST /me/contacts/lookup`
 

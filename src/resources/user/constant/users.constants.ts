@@ -137,3 +137,74 @@ export const googleNoAccount = (email: string): string =>
 export const CONTACT_USER_SELECT = {
   contactUser: { select: { id: true, name: true, avatarUrl: true } },
 } as const;
+
+// ── paging + search over the caller's own contacts ──────────────────────
+
+/**
+ * Page size for `GET /me/contacts/page`. 10 fills a phone screen; 50 is the
+ * ceiling so a client cannot turn the paged route back into an unbounded dump
+ * of every contact — that is what the (deliberately unpaginated) legacy
+ * `GET /me/contacts` is for, and it is capped by human behaviour instead.
+ */
+export const CONTACT_PAGE_DEFAULT_LIMIT = 10;
+export const CONTACT_PAGE_MAX_LIMIT = 50;
+
+/**
+ * Favourites first, then A-Z, then id.
+ *
+ * The trailing `id` is NOT decoration: two contacts called "Mum" would
+ * otherwise have no defined relative order, and Postgres is free to return
+ * them differently on each query. With `skip`/`take` that means a row can be
+ * shown twice and another never shown at all as the user pages. A total order
+ * — and `id` is unique, so this is one — makes paging stable.
+ */
+export const CONTACT_PAGE_ORDER_BY = [
+  { favorite: 'desc' },
+  { name: 'asc' },
+  { id: 'asc' },
+] as const;
+
+// ── contact groups ──────────────────────────────────────────────────────
+
+export const CONTACT_GROUP_NAME_MAX_LENGTH = 60;
+
+/**
+ * Membership projection for a group view. Only the contact ids: the group list
+ * is a picker, and re-serialising every contact inside every group would make
+ * a screen that already calls `GET /me/contacts` pay for the same rows twice.
+ * Ordered by id so `contactIds` is deterministic across calls.
+ */
+export const CONTACT_GROUP_MEMBERS_INCLUDE = {
+  members: { select: { contactId: true }, orderBy: { contactId: 'asc' } },
+} as const;
+
+/** Same ordering rationale as {@link CONTACT_PAGE_ORDER_BY}. */
+export const CONTACT_GROUP_ORDER_BY = [
+  { favorite: 'desc' },
+  { name: 'asc' },
+  { id: 'asc' },
+] as const;
+
+/**
+ * Deliberately the same 404 wording style as {@link CONTACT_NOT_FOUND}: a group
+ * id belonging to somebody else gets this, NOT a 403, so the endpoint never
+ * confirms that an id it refuses is an id that exists.
+ */
+export const CONTACT_GROUP_NOT_FOUND =
+  'No such contact group in your account. It may have been deleted, or the id belongs to another account — list your groups with GET /me/contact-groups.';
+
+/**
+ * Duplicate group name. Quotes the name that is ALREADY stored (not what the
+ * caller typed), so someone who types "family" when they already have "Family"
+ * can see why it clashed.
+ */
+export const duplicateContactGroupName = (existingName: string): string =>
+  `You already have a contact group called "${existingName}". Pick a different name, or edit that group instead.`;
+
+/**
+ * Contact ids that are not the caller's. Worded and shaped exactly like the
+ * watcher-contact check in TripsService.createTrip, because it is the same
+ * mistake from the app's point of view: a stale id in a list picker.
+ */
+export const contactIdsNotYours = (badIds: string[]): string =>
+  `These contact ids are not in your trusted contacts: ${badIds.join(', ')}. Remove them or add the contacts first.`;

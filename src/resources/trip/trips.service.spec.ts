@@ -32,6 +32,9 @@ const ACTIVE_CONFLICT_MSG = ACTIVE_TRIP_CONFLICT_MSG;
  * that omission is exactly the bug this suite exists to prevent.
  */
 const LIVE_STATUSES = [TripStatus.ACTIVE, TripStatus.SOS];
+// The narrowed set the AUTOMATIC closes must use: an alarm raised between their
+// status read and their write has to win, so the row itself refuses SOS.
+const ACTIVE_ONLY = [TripStatus.ACTIVE];
 
 /** `expect.any(Date)` typed as Date so it can sit inside typed matcher literals. */
 const ANY_DATE = expect.any(Date) as unknown as Date;
@@ -892,7 +895,7 @@ describe('TripsService', () => {
 
       expect(result?.status).toBe(TripStatus.CANCELLED);
       expect(prisma.trip.updateMany).toHaveBeenCalledWith({
-        where: { id: 'trip-1', status: { in: LIVE_STATUSES } },
+        where: { id: 'trip-1', status: { in: ACTIVE_ONLY } },
         data: {
           status: TripStatus.CANCELLED,
           endedAt: ANY_DATE,
@@ -957,11 +960,146 @@ describe('TripsService', () => {
       expect(notifications.sendToUsers).not.toHaveBeenCalled();
     });
 
+    it('scopes the WRITE to ACTIVE, so an SOS raised after the read still wins', async () => {
+      // The status check above is a read; the traveller can raise the alarm in
+      // the gap before this write. The row must refuse the transition — an
+      // advisory guard would cancel the alarm, clear presence, tell watchers
+      // CANCELLED and push "we closed your trip" at the people just alerted.
+      const trip = baseTrip();
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+      prisma.trip.updateMany.mockResolvedValueOnce({ count: 0 });
+      prisma.trip.findUniqueOrThrow.mockResolvedValueOnce({
+        ...trip,
+        status: TripStatus.SOS,
+      });
+
+      await expect(service.autoCloseTrip('trip-1')).resolves.toBeNull();
+
+      expect(prisma.trip.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'trip-1', status: { in: ACTIVE_ONLY } },
+        }),
+      );
+      expect(redis.clearPresence).not.toHaveBeenCalled();
+      expect(redis.publishJson).not.toHaveBeenCalled();
+      expect(notifications.sendToUsers).not.toHaveBeenCalled();
+    });
+
     it('returns null for a trip that does not exist', async () => {
       prisma.trip.findUnique.mockResolvedValueOnce(null);
 
       await expect(service.autoCloseTrip('nope')).resolves.toBeNull();
       expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── completeIfArrived (the trip-monitor's stage 0) ──────────────────────
+
+  describe('completeIfArrived', () => {
+    /** One row back from the ST_DWithin probe = a stored fix inside the circle. */
+    const arrivalHit = [{ hit: 1 }];
+
+    it('completes as COMPLETED when a stored breadcrumb sits inside the arrival radius', async () => {
+      const trip = baseTrip();
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+      prisma.$queryRaw.mockResolvedValueOnce(arrivalHit);
+      prisma.trip.updateMany.mockResolvedValueOnce({ count: 1 });
+      prisma.trip.findUniqueOrThrow.mockResolvedValueOnce({
+        ...trip,
+        status: TripStatus.COMPLETED,
+        endedAt: new Date(),
+        durationS: 3600,
+      });
+
+      await expect(service.completeIfArrived('trip-1')).resolves.toBe(true);
+
+      expect(prisma.trip.updateMany).toHaveBeenCalledWith({
+        where: { id: 'trip-1', status: { in: ACTIVE_ONLY } },
+        data: {
+          status: TripStatus.COMPLETED,
+          endedAt: ANY_DATE,
+          durationS: ANY_NUMBER,
+        },
+      });
+      // Full teardown, exactly as a real arrival: presence cleared, watchers told.
+      expect(redis.clearPresence).toHaveBeenCalledWith(owner.id);
+      expect(redis.publishJson).toHaveBeenCalledWith(
+        channelTripLive('trip-1'),
+        expect.objectContaining({
+          kind: 'status',
+          status: TripStatus.COMPLETED,
+        }),
+      );
+    });
+
+    it('leaves the trip alone when no stored point ever reached the destination', async () => {
+      prisma.trip.findUnique.mockResolvedValueOnce(baseTrip());
+      prisma.$queryRaw.mockResolvedValueOnce([]);
+
+      await expect(service.completeIfArrived('trip-1')).resolves.toBe(false);
+
+      expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+      expect(notifications.sendToUsers).not.toHaveBeenCalled();
+    });
+
+    it('REFUSES a trip in SOS — an open alarm is never closed as an arrival', async () => {
+      prisma.trip.findUnique.mockResolvedValueOnce({
+        ...baseTrip(),
+        status: TripStatus.SOS,
+      });
+
+      await expect(service.completeIfArrived('trip-1')).resolves.toBe(false);
+
+      // Not even asked: an SOS trip's breadcrumbs are none of this rung's business.
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
+      expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+    });
+
+    it.each([TripStatus.COMPLETED, TripStatus.CANCELLED])(
+      'returns false for a trip that already ended (%s)',
+      async (status) => {
+        prisma.trip.findUnique.mockResolvedValueOnce({
+          ...baseTrip(),
+          status,
+          endedAt: new Date('2026-07-22T09:00:00Z'),
+        });
+
+        await expect(service.completeIfArrived('trip-1')).resolves.toBe(false);
+        expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+      },
+    );
+
+    it('returns false when a real stop won the race, so the monitor announces nothing', async () => {
+      const trip = baseTrip();
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+      prisma.$queryRaw.mockResolvedValueOnce(arrivalHit);
+      prisma.trip.updateMany.mockResolvedValueOnce({ count: 0 });
+      prisma.trip.findUniqueOrThrow.mockResolvedValueOnce({
+        ...trip,
+        status: TripStatus.COMPLETED,
+        endedAt: new Date(),
+      });
+
+      await expect(service.completeIfArrived('trip-1')).resolves.toBe(false);
+
+      expect(redis.publishJson).not.toHaveBeenCalled();
+      expect(notifications.sendToUsers).not.toHaveBeenCalled();
+    });
+
+    it('treats a failed spatial lookup as "we do not know", never as an arrival', async () => {
+      prisma.trip.findUnique.mockResolvedValueOnce(baseTrip());
+      prisma.$queryRaw.mockRejectedValueOnce(new Error('PostGIS is down'));
+
+      await expect(service.completeIfArrived('trip-1')).resolves.toBe(false);
+
+      expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('returns false for a trip that does not exist', async () => {
+      prisma.trip.findUnique.mockResolvedValueOnce(null);
+
+      await expect(service.completeIfArrived('nope')).resolves.toBe(false);
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
     });
   });
 
@@ -996,9 +1134,191 @@ describe('TripsService', () => {
       expect(result.accepted).toBe(1);
       expect(prisma.trip.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: 'trip-1', status: { in: LIVE_STATUSES } },
+          where: { id: 'trip-1', status: { in: ACTIVE_ONLY } },
         }),
       );
+    });
+
+    it('does NOT report autoCompleted when an SOS raised mid-request blocks the close', async () => {
+      // Same read-then-write gap as autoCloseTrip. The guarded update matches 0
+      // rows and the trip is still live, so nothing ended — and the client must
+      // NOT be told otherwise: the app tears its background GPS task down on
+      // `autoCompleted`, which is the worst moment to lose the feed.
+      const trip = activeTrip();
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+      prisma.trip.updateMany.mockResolvedValueOnce({ count: 0 });
+      prisma.trip.findUniqueOrThrow.mockResolvedValueOnce({
+        ...trip,
+        status: TripStatus.SOS,
+      });
+
+      const result = await service.addPoints(owner, 'trip-1', {
+        points: [
+          {
+            lat: trip.destLat,
+            lng: trip.destLng,
+            recordedAt: new Date('2026-07-22T09:00:00Z'),
+          },
+        ],
+      });
+
+      expect(result.autoCompleted).toBe(false);
+      expect(result.accepted).toBe(1);
+      expect(notifications.sendToUsers).not.toHaveBeenCalled();
+    });
+
+    it('still reports autoCompleted when a concurrent stop ended the trip first', async () => {
+      // Lost the race to a real ending, not to an alarm. The journey IS over, so
+      // the client is told to stop tracking — it just does not re-announce it.
+      const trip = activeTrip();
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+      prisma.trip.updateMany.mockResolvedValueOnce({ count: 0 });
+      prisma.trip.findUniqueOrThrow.mockResolvedValueOnce({
+        ...trip,
+        status: TripStatus.COMPLETED,
+        endedAt: new Date('2026-07-22T09:00:00Z'),
+      });
+
+      const result = await service.addPoints(owner, 'trip-1', {
+        points: [
+          {
+            lat: trip.destLat,
+            lng: trip.destLng,
+            recordedAt: new Date('2026-07-22T09:00:00Z'),
+          },
+        ],
+      });
+
+      expect(result.autoCompleted).toBe(true);
+      expect(notifications.sendToUsers).not.toHaveBeenCalled();
+    });
+
+    it('auto-completes when a MIDDLE point of the batch is at the destination and the last one is far past it', async () => {
+      // THE REPORTED BUG. The client batches ~60s / ~150m of travel per upload
+      // (plus the whole retry queue prepended), so a car crosses the 150m circle
+      // between two fixes. Testing only the tail answered "not arrived", the row
+      // stayed ACTIVE, and every screen went on calling the finished journey live.
+      const trip = activeTrip();
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+      prisma.trip.updateMany.mockResolvedValueOnce({ count: 1 });
+      prisma.trip.findUniqueOrThrow.mockResolvedValueOnce({
+        ...trip,
+        status: TripStatus.COMPLETED,
+      });
+
+      const result = await service.addPoints(owner, 'trip-1', {
+        points: [
+          {
+            // Approaching — ~11km out.
+            lat: trip.destLat - 0.1,
+            lng: trip.destLng,
+            recordedAt: new Date('2026-07-22T08:58:00Z'),
+          },
+          {
+            // On the destination. This is the arrival.
+            lat: trip.destLat,
+            lng: trip.destLng,
+            recordedAt: new Date('2026-07-22T08:59:00Z'),
+          },
+          {
+            // Drove on / parked round the corner — ~11km past it.
+            lat: trip.destLat + 0.1,
+            lng: trip.destLng,
+            recordedAt: new Date('2026-07-22T09:00:00Z'),
+          },
+        ],
+      });
+
+      expect(result.autoCompleted).toBe(true);
+      expect(result.accepted).toBe(3);
+      expect(prisma.trip.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'trip-1', status: { in: ACTIVE_ONLY } },
+        }),
+      );
+    });
+
+    it('scans in RECORDED order, not the order the points arrived in', async () => {
+      // Uploads are not sorted: `deliverPoints` prepends the persisted retry
+      // queue to the fresh batch, so the arrival must be found by timestamp.
+      const trip = activeTrip();
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+      prisma.trip.updateMany.mockResolvedValueOnce({ count: 1 });
+      prisma.trip.findUniqueOrThrow.mockResolvedValueOnce({
+        ...trip,
+        status: TripStatus.COMPLETED,
+      });
+
+      const result = await service.addPoints(owner, 'trip-1', {
+        points: [
+          {
+            lat: trip.destLat,
+            lng: trip.destLng,
+            recordedAt: new Date('2026-07-22T09:05:00Z'),
+          },
+          {
+            lat: trip.destLat - 0.1,
+            lng: trip.destLng,
+            recordedAt: new Date('2026-07-22T08:50:00Z'),
+          },
+        ],
+      });
+
+      expect(result.autoCompleted).toBe(true);
+      // lastPointAt still tracks the NEWEST recorded fix, not the array tail.
+      expect(prisma.trip.update).toHaveBeenCalledWith({
+        where: { id: 'trip-1' },
+        data: { lastPointAt: new Date('2026-07-22T09:05:00Z') },
+      });
+    });
+
+    it('does NOT auto-complete when NO point in the batch reaches the geofence', async () => {
+      const trip = activeTrip();
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+
+      const result = await service.addPoints(owner, 'trip-1', {
+        points: [
+          {
+            lat: trip.destLat - 0.1,
+            lng: trip.destLng,
+            recordedAt: new Date('2026-07-22T08:59:00Z'),
+          },
+          {
+            lat: trip.destLat + 0.1,
+            lng: trip.destLng,
+            recordedAt: new Date('2026-07-22T09:00:00Z'),
+          },
+        ],
+      });
+
+      expect(result.autoCompleted).toBe(false);
+      expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('does NOT auto-complete a batch that passes the destination while the trip is in SOS', async () => {
+      // The batch-wide scan must not widen the SOS exemption: no "arrived
+      // safely" to the contacts an open alarm just alerted.
+      const trip = { ...activeTrip(), status: TripStatus.SOS };
+      prisma.trip.findUnique.mockResolvedValueOnce(trip);
+
+      const result = await service.addPoints(owner, 'trip-1', {
+        points: [
+          {
+            lat: trip.destLat,
+            lng: trip.destLng,
+            recordedAt: new Date('2026-07-22T08:59:00Z'),
+          },
+          {
+            lat: trip.destLat + 0.1,
+            lng: trip.destLng,
+            recordedAt: new Date('2026-07-22T09:00:00Z'),
+          },
+        ],
+      });
+
+      expect(result.autoCompleted).toBe(false);
+      expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+      expect(notifications.sendToUsers).not.toHaveBeenCalled();
     });
 
     it('does NOT auto-complete when the last point is far from the destination', async () => {

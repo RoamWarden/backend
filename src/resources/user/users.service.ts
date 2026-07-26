@@ -12,11 +12,18 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../providers/redis/redis.service';
 import { normalizeEmail } from '../../common/transforms/normalize-email';
 import type { CreateContactDto } from './dto/create-contact.dto';
+import type { CreateContactGroupDto } from './dto/create-contact-group.dto';
+import type { ListContactGroupsQueryDto } from './dto/list-contact-groups.query.dto';
+import type { ListContactsQueryDto } from './dto/list-contacts.query.dto';
 import type { RegisterDeviceDto } from './dto/register-device.dto';
 import type { UpdateContactDto } from './dto/update-contact.dto';
+import type { UpdateContactGroupDto } from './dto/update-contact-group.dto';
 import type { UpdateProfileDto } from './dto/update-profile.dto';
 import { ThrottlerException } from '@nestjs/throttler';
 import {
+  CONTACT_GROUP_MEMBERS_INCLUDE,
+  CONTACT_GROUP_NOT_FOUND,
+  CONTACT_GROUP_ORDER_BY,
   CONTACT_LOOKUP_MAX_PER_WINDOW,
   CONTACT_LOOKUP_NO_ACCOUNT,
   CONTACT_LOOKUP_RATE_LIMITED,
@@ -26,23 +33,31 @@ import {
   CONTACT_LOOKUP_WINDOW_S,
   CONTACT_NEEDS_REACHABLE_FIELD,
   CONTACT_NOT_FOUND,
+  CONTACT_PAGE_DEFAULT_LIMIT,
+  CONTACT_PAGE_MAX_LIMIT,
+  CONTACT_PAGE_ORDER_BY,
   CONTACT_SELF_LINK,
   CONTACT_USER_SELECT,
   DUPLICATE_LINKED_CONTACT,
   GOOGLE_NO_ACCOUNT_CODE,
   LINKED_USER_NOT_FOUND,
+  contactIdsNotYours,
   contactLookupAlreadyAdded,
   contactLookupFound,
   contactLookupQuotaKey,
+  duplicateContactGroupName,
   googleEmailLinkedElsewhere,
   googleEmailNotVerified,
   googleNoAccount,
 } from './constant/users.constants';
 import type {
+  ContactGroupView,
+  ContactGroupWithMembers,
   ContactUserLookupResult,
   ContactWithLinkedUser,
   GoogleIdentity,
   GoogleUpsertOptions,
+  PaginatedContacts,
   ProfileWithCounts,
   UserProfile,
 } from './type/users.types';
@@ -407,12 +422,79 @@ export class UsersService {
 
   // ── trusted contacts ──────────────────────────────────────────────────
 
+  /**
+   * EVERY contact, oldest first, as a flat array.
+   *
+   * DELIBERATELY NOT PAGINATED, and the shape is frozen. TestFlight builds that
+   * are already on people's phones call `GET /me/contacts` and index straight
+   * into the array; wrapping it in `{ data, page, … }` would break them in the
+   * field, on the screen that arms the SOS feature. New fields may be ADDED to
+   * each item (that is how `favorite` arrived) — the envelope may not change.
+   * Anything that wants paging or search uses {@link listContactsPage}.
+   */
   listContacts(userId: string): Promise<ContactWithLinkedUser[]> {
     return this.prisma.trustedContact.findMany({
       where: { userId },
       orderBy: { createdAt: 'asc' },
       include: CONTACT_USER_SELECT,
     });
+  }
+
+  /**
+   * One page of the caller's own contacts, optionally filtered by `q`.
+   *
+   * `q` is a case-insensitive substring of name OR email OR phone, because a
+   * person searching their contact list types whichever of the three they
+   * happen to remember — "mum", "@gmail", or the last four digits of a number.
+   * Matching only `name` sends people to the empty state while the contact they
+   * want is sitting three rows down.
+   *
+   * Partial matching is safe HERE and nowhere else: the `where` is anchored on
+   * `userId`, so this only ever searches rows the caller already owns. The
+   * account lookup in {@link lookupContactUserByEmail} stays exact-match for
+   * exactly the reason this one need not be.
+   *
+   * `total` counts the whole filtered set, not this page, so the UI can render
+   * "12 of 40" and decide whether a next page exists. Count and page come from
+   * ONE transaction so they cannot disagree about a row added mid-request.
+   */
+  async listContactsPage(
+    userId: string,
+    query: ListContactsQueryDto,
+  ): Promise<PaginatedContacts> {
+    const page = query.page ?? 1;
+    const limit = Math.min(
+      query.limit ?? CONTACT_PAGE_DEFAULT_LIMIT,
+      CONTACT_PAGE_MAX_LIMIT,
+    );
+    const q = query.q?.trim();
+    const where: Prisma.TrustedContactWhereInput = {
+      userId,
+      ...(q
+        ? {
+            OR: [
+              { name: { contains: q, mode: 'insensitive' as const } },
+              { email: { contains: q, mode: 'insensitive' as const } },
+              { phone: { contains: q, mode: 'insensitive' as const } },
+            ],
+          }
+        : {}),
+    };
+
+    const [data, total] = await this.prisma.$transaction([
+      this.prisma.trustedContact.findMany({
+        where,
+        orderBy: [...CONTACT_PAGE_ORDER_BY],
+        skip: (page - 1) * limit,
+        take: limit,
+        include: CONTACT_USER_SELECT,
+      }),
+      this.prisma.trustedContact.count({ where }),
+    ]);
+
+    // Same item shape as listContacts, so a client can move between the two
+    // routes without a second mapper.
+    return { data, page, limit, total };
   }
 
   /**
@@ -592,6 +674,9 @@ export class UsersService {
     if (dto.email !== undefined) data.email = dto.email;
     if (dto.relation !== undefined) data.relation = dto.relation;
     if (dto.contactUserId !== undefined) data.contactUserId = dto.contactUserId;
+    // A pure display preference — it deliberately skips the "reachable somehow"
+    // re-check above, because favouriting cannot make a contact unreachable.
+    if (dto.favorite !== undefined) data.favorite = dto.favorite;
 
     try {
       return await this.prisma.trustedContact.update({
@@ -625,6 +710,179 @@ export class UsersService {
     });
     if (count === 0) {
       throw new NotFoundException(CONTACT_NOT_FOUND);
+    }
+  }
+
+  // ── contact groups ────────────────────────────────────────────────────
+  //
+  // A contact group is the OWNER'S OWN LABEL over contacts they already have —
+  // "Family", "Work". It is private to them and is NOT the family-plan Group in
+  // src/resources/group: nobody joins one, nobody is invited to one, and nobody
+  // is notified because of one. Grouping therefore grants no reach whatsoever;
+  // every fan-out still passes through filterConsentingContactUserIds.
+  //
+  // Ownership is enforced on EVERY route by scoping the query to `userId`, and
+  // a miss is a 404 with the same wording style as a deleted group — never a
+  // 403, which would confirm that the id exists on somebody else's account.
+
+  /** The caller's groups, favourites first. `q` filters on the group name. */
+  async listContactGroups(
+    userId: string,
+    query: ListContactGroupsQueryDto = {},
+  ): Promise<ContactGroupView[]> {
+    const q = query.q?.trim();
+    const groups = await this.prisma.contactGroup.findMany({
+      where: {
+        userId,
+        ...(q ? { name: { contains: q, mode: 'insensitive' as const } } : {}),
+      },
+      orderBy: [...CONTACT_GROUP_ORDER_BY],
+      include: CONTACT_GROUP_MEMBERS_INCLUDE,
+    });
+    return groups.map((group) => this.toContactGroupView(group));
+  }
+
+  /**
+   * Creates a group and files the given contacts into it in ONE write, so a
+   * failure half-way cannot leave a nameless group or an orphaned membership.
+   */
+  async createContactGroup(
+    userId: string,
+    dto: CreateContactGroupDto,
+  ): Promise<ContactGroupView> {
+    // The DTO already trims; repeated here so a service-level caller (tests,
+    // future internal use) can never store a name with edge whitespace.
+    const name = dto.name.trim();
+    const contactIds = await this.assertOwnedContactIds(userId, dto.contactIds);
+    await this.assertContactGroupNameFree(userId, name, null);
+
+    try {
+      const group = await this.prisma.contactGroup.create({
+        data: {
+          userId,
+          name,
+          favorite: dto.favorite ?? false,
+          ...(contactIds.length > 0
+            ? {
+                members: {
+                  create: contactIds.map((contactId) => ({ contactId })),
+                },
+              }
+            : {}),
+        },
+        include: CONTACT_GROUP_MEMBERS_INCLUDE,
+      });
+      return this.toContactGroupView(group);
+    } catch (error) {
+      // Race against a concurrent create of the same name (double-tap, retry).
+      // The pre-check above cannot win this one — UNIQUE(user_id, name) does.
+      if (this.isPrismaError(error, 'P2002')) {
+        throw new ConflictException(duplicateContactGroupName(name));
+      }
+      // Race: a contact was deleted between the ownership check and this write.
+      if (this.isPrismaError(error, 'P2003')) {
+        throw new BadRequestException(contactIdsNotYours(contactIds));
+      }
+      this.logger.error(
+        `Unexpected error creating contact group for user ${userId}`,
+        error instanceof Error ? error.stack : String(error),
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * Renames / re-favourites a group and, ONLY when `contactIds` is present,
+   * replaces its entire membership.
+   *
+   * Present vs absent is the whole contract: `[]` empties the group, three ids
+   * leave exactly those three, and omitting the field leaves membership alone.
+   * That distinction is why the replacement is a delete-then-insert rather than
+   * an upsert — the app can rename a group without having to re-send a roster
+   * it may not have loaded, and cannot silently truncate one by forgetting to.
+   *
+   * The rewrite runs inside a transaction so the group is never observed with
+   * its old members removed and its new ones not yet added.
+   */
+  async updateContactGroup(
+    userId: string,
+    groupId: string,
+    dto: UpdateContactGroupDto,
+  ): Promise<ContactGroupView> {
+    const existing = await this.prisma.contactGroup.findFirst({
+      where: { id: groupId, userId },
+      select: { id: true, name: true },
+    });
+    if (!existing) {
+      throw new NotFoundException(CONTACT_GROUP_NOT_FOUND);
+    }
+
+    const name = dto.name?.trim();
+    if (name !== undefined && name !== existing.name) {
+      await this.assertContactGroupNameFree(userId, name, groupId);
+    }
+    // null = "leave the membership alone"; an array = "this is the new one".
+    const replacementIds =
+      dto.contactIds === undefined
+        ? null
+        : await this.assertOwnedContactIds(userId, dto.contactIds);
+
+    const data: Prisma.ContactGroupUncheckedUpdateInput = {};
+    if (name !== undefined) data.name = name;
+    if (dto.favorite !== undefined) data.favorite = dto.favorite;
+
+    try {
+      const group = await this.prisma.$transaction(async (tx) => {
+        if (replacementIds !== null) {
+          await tx.contactGroupMember.deleteMany({ where: { groupId } });
+          if (replacementIds.length > 0) {
+            await tx.contactGroupMember.createMany({
+              data: replacementIds.map((contactId) => ({ groupId, contactId })),
+            });
+          }
+        }
+        // Last, so its `include` reads back the membership we just wrote.
+        return tx.contactGroup.update({
+          where: { id: groupId },
+          data,
+          include: CONTACT_GROUP_MEMBERS_INCLUDE,
+        });
+      });
+      return this.toContactGroupView(group);
+    } catch (error) {
+      if (this.isPrismaError(error, 'P2002')) {
+        throw new ConflictException(
+          duplicateContactGroupName(name ?? existing.name),
+        );
+      }
+      if (this.isPrismaError(error, 'P2025')) {
+        throw new NotFoundException(CONTACT_GROUP_NOT_FOUND);
+      }
+      if (this.isPrismaError(error, 'P2003')) {
+        throw new BadRequestException(contactIdsNotYours(replacementIds ?? []));
+      }
+      this.logger.error(
+        `Unexpected error updating contact group ${groupId} for user ${userId}`,
+        error instanceof Error ? error.stack : String(error),
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * Deletes the group. THE CONTACTS SURVIVE — the cascade runs from
+   * `contact_groups` to `contact_group_members` and stops there, so tidying up
+   * a label can never cost someone the trusted contacts their SOS depends on.
+   *
+   * Scoped by `userId` in the same statement as the delete, so another
+   * account's id deletes nothing and gets the ordinary not-found message.
+   */
+  async deleteContactGroup(userId: string, groupId: string): Promise<void> {
+    const { count } = await this.prisma.contactGroup.deleteMany({
+      where: { id: groupId, userId },
+    });
+    if (count === 0) {
+      throw new NotFoundException(CONTACT_GROUP_NOT_FOUND);
     }
   }
 
@@ -790,6 +1048,76 @@ export class UsersService {
       );
       throw new ThrottlerException(CONTACT_LOOKUP_RATE_LIMITED);
     }
+  }
+
+  /**
+   * Every id must be one of THIS caller's trusted contacts. Deduped, and the
+   * rejection names the offending ids — mirrors the `watcherContactIds` check
+   * in TripsService.createTrip, because to the app it is the same mistake: a
+   * stale id left in a list picker.
+   *
+   * Returns the deduped ids so callers write them exactly once.
+   */
+  private async assertOwnedContactIds(
+    userId: string,
+    ids: string[] | undefined,
+  ): Promise<string[]> {
+    const contactIds = [...new Set(ids ?? [])];
+    if (contactIds.length === 0) return [];
+    const contacts = await this.prisma.trustedContact.findMany({
+      where: { id: { in: contactIds }, userId },
+      select: { id: true },
+    });
+    const foundIds = new Set(contacts.map((contact) => contact.id));
+    const badIds = contactIds.filter((id) => !foundIds.has(id));
+    if (badIds.length > 0) {
+      // Anything not owned by the caller — including a real id on someone
+      // else's account — lands here, so this never confirms that an id exists.
+      throw new BadRequestException(contactIdsNotYours(badIds));
+    }
+    return contactIds;
+  }
+
+  /**
+   * Refuses a group name the caller is already using. Matched
+   * case-INSENSITIVELY even though the unique index is exact, because "family"
+   * and "Family" are the same label to a human and two of them in a picker is
+   * a bug report. `exceptGroupId` lets a rename keep its own name.
+   *
+   * A pre-check, not the guarantee: `UNIQUE(user_id, name)` is what actually
+   * stops a concurrent double-create, and the P2002 handlers translate it.
+   */
+  private async assertContactGroupNameFree(
+    userId: string,
+    name: string,
+    exceptGroupId: string | null,
+  ): Promise<void> {
+    const clash = await this.prisma.contactGroup.findFirst({
+      where: {
+        userId,
+        name: { equals: name, mode: 'insensitive' },
+        ...(exceptGroupId ? { id: { not: exceptGroupId } } : {}),
+      },
+      select: { name: true },
+    });
+    if (clash) {
+      // Quotes the STORED name, so someone who typed "family" can see it
+      // clashed with the "Family" they already have.
+      throw new ConflictException(duplicateContactGroupName(clash.name));
+    }
+  }
+
+  /** Group row → API shape. `memberCount` saves the UI reaching into an array. */
+  private toContactGroupView(group: ContactGroupWithMembers): ContactGroupView {
+    const contactIds = group.members.map((member) => member.contactId);
+    return {
+      id: group.id,
+      name: group.name,
+      favorite: group.favorite,
+      memberCount: contactIds.length,
+      contactIds,
+      createdAt: group.createdAt,
+    };
   }
 
   /** Linked contact must be a real user and not the owner themselves. */

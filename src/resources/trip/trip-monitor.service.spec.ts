@@ -68,6 +68,7 @@ describe('TripMonitorService', () => {
     getWatcherUserIds: AnyMock;
     buildLiveShareUrl: AnyMock;
     autoCloseTrip: AnyMock;
+    completeIfArrived: AnyMock;
   };
 
   beforeEach(async () => {
@@ -94,6 +95,9 @@ describe('TripMonitorService', () => {
         ),
       // Default null = "someone else already ended it", the conservative answer.
       autoCloseTrip: jest.fn().mockResolvedValue(null),
+      // Default false = "no recorded arrival", so every existing ladder test
+      // still runs the ladder. Stage 0 opts in explicitly.
+      completeIfArrived: jest.fn().mockResolvedValue(false),
     };
 
     const moduleRef: TestingModule = await Test.createTestingModule({
@@ -111,6 +115,80 @@ describe('TripMonitorService', () => {
 
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  // ── STAGE 0: a silent trip that already arrived ─────────────────────────
+
+  describe('escalateOverdueTrips — stage 0 (arrived, we just missed it)', () => {
+    /** Stalled: active well past the minimum, breadcrumb older than the timeout. */
+    const stalledTrip = (overrides: Partial<MonitoredTrip> = {}) =>
+      buildTrip({
+        startedAt: new Date(NOW - 60 * 60 * 1000),
+        lastPointAt: new Date(NOW - 60 * 60 * 1000),
+        ...overrides,
+      });
+
+    it('closes a stalled trip whose breadcrumbs reached the destination, and raises no alarm about it', async () => {
+      const trip = stalledTrip();
+      prisma.trip.findMany.mockResolvedValue([trip]);
+      trips.completeIfArrived.mockResolvedValue(true);
+
+      await service.escalateOverdueTrips();
+
+      expect(trips.completeIfArrived).toHaveBeenCalledWith(trip.id);
+      // THE POINT: no "Are you OK?", no contact alert, no overdue flag on the
+      // live view. `completeTrip` already published the status and sent the
+      // safe-arrival push — the ladder must not run at all.
+      expect(notifications.sendToUsers).not.toHaveBeenCalled();
+      expect(redis.publishJson).not.toHaveBeenCalled();
+      expect(prisma.trip.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('falls through to the usual nudge when there is no recorded arrival', async () => {
+      const trip = stalledTrip();
+      prisma.trip.findMany.mockResolvedValue([trip]);
+      trips.completeIfArrived.mockResolvedValue(false);
+
+      await service.escalateOverdueTrips();
+
+      expect(trips.completeIfArrived).toHaveBeenCalledWith(trip.id);
+      expect(notifications.sendToUsers).toHaveBeenCalledWith(
+        [OWNER_ID],
+        expect.objectContaining({ title: 'Are you OK?' }),
+      );
+    });
+
+    it('never asks about a trip that is still sending its location', async () => {
+      // Overdue but NOT stalled (a fresh breadcrumb) — the traveller is moving,
+      // so ending the journey for them is never on the table.
+      const trip = overdueTrip({ lastPointAt: new Date(NOW - 60 * 1000) });
+      prisma.trip.findMany.mockResolvedValue([trip]);
+
+      await service.escalateOverdueTrips();
+
+      expect(trips.completeIfArrived).not.toHaveBeenCalled();
+      expect(notifications.sendToUsers).toHaveBeenCalledWith(
+        [OWNER_ID],
+        expect.objectContaining({ title: 'Are you OK?' }),
+      );
+    });
+
+    it('closes an already-escalated trip as arrived instead of waiting out the silence window', async () => {
+      // The old ladder's only exit here was CANCELLED, hours later. Evidence of
+      // arrival outranks it — and corrects the contacts who were told otherwise.
+      const trip = stalledTrip({
+        overdueNotifiedAt: new Date(NOW - 2 * 3600 * 1000),
+        escalatedAt: new Date(NOW - 2 * 3600 * 1000),
+      });
+      prisma.trip.findMany.mockResolvedValue([trip]);
+      trips.completeIfArrived.mockResolvedValue(true);
+
+      await service.escalateOverdueTrips();
+
+      expect(trips.completeIfArrived).toHaveBeenCalledWith(trip.id);
+      expect(trips.autoCloseTrip).not.toHaveBeenCalled();
+      expect(notifications.sendToUsers).not.toHaveBeenCalled();
+    });
   });
 
   // ── STAGE 1: nudge the owner ────────────────────────────────────────────

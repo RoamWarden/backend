@@ -4,11 +4,31 @@
 // types. They are nullable so the generated client stays fully usable; services
 // populate them with raw SQL in the same transaction as the row write, and all
 // geo queries (corridor matching, radius search, bbox) go through
-// $queryRaw/$executeRaw. Every geography column gets a GiST index (added by
-// hand in the migration).
+// $queryRaw/$executeRaw.
 //
 // Plain lat/lng float columns sit alongside each geography column so reads
 // never need PostGIS round-trips.
+//
+// ── GiST indexes are DECLARED HERE. Do not hand-write them again. ───────────
+// Every geography column carries a GiST index. These used to be added by hand
+// in raw SQL because the datamodel could not express them — so Prisma could not
+// SEE them, and every generated migration opened by DROPping all five, plus the
+// `DEFAULT ARRAY[]::TEXT[]` on plans.features and sos_escalations.contact_order.
+// The only defence was a human deleting those lines from each new migration by
+// hand, and applying even one would have quietly turned every corridor / radius
+// / bbox query into a sequential scan. No error — just a database getting
+// slower forever.
+//
+// They are now `@@index([...], type: Gist, map: "<original name>")` on the
+// models below, and `@default([])` on the two array columns, so the datamodel
+// matches the database and the diff comes back clean. `map:` pins the ORIGINAL
+// index names — changing one renames a live production index.
+//
+// IF A GENERATED MIGRATION EVER CONTAINS `DROP INDEX ..._gix`, OR
+// `ALTER COLUMN ... DROP DEFAULT` on those two columns, do NOT hand-strip it:
+// it means a declaration below was lost and the schema has drifted again. Fix
+// the model instead. `src/prisma/migration-safety.spec.ts` fails the build if
+// such a migration is ever committed.
 
 generator client {
   provider        = "prisma-client-js"
@@ -149,6 +169,9 @@ model User {
   emailVerifications  EmailVerificationOtp[]
   trustedContacts     TrustedContact[]       @relation("owner")
   linkedAsContact     TrustedContact[]       @relation("contactUser")
+  // The owner's own labels over their contact list ("Family", "Work"). Private
+  // to this account — see the ContactGroup model.
+  contactGroups       ContactGroup[]
   trips               Trip[]
   reports             Report[]
   reportVotes         ReportVote[]
@@ -240,15 +263,59 @@ model TrustedContact {
   phone         String?
   email         String?
   relation      String?
+  // "Pin this person to the top of my list." Purely a display preference — it
+  // grants no extra reach, no priority in an SOS fan-out and no consent. It
+  // defaults to false so every existing row is valid the instant the column
+  // lands, which is what makes the migration safe to apply before the deploy.
+  favorite      Boolean  @default(false)
   createdAt     DateTime @default(now()) @map("created_at")
 
-  user        User          @relation("owner", fields: [userId], references: [id], onDelete: Cascade)
-  contactUser User?         @relation("contactUser", fields: [contactUserId], references: [id], onDelete: SetNull)
-  watching    TripWatcher[]
+  user             User                 @relation("owner", fields: [userId], references: [id], onDelete: Cascade)
+  contactUser      User?                @relation("contactUser", fields: [contactUserId], references: [id], onDelete: SetNull)
+  watching         TripWatcher[]
+  groupMemberships ContactGroupMember[]
 
   @@unique([userId, contactUserId])
   @@index([userId])
   @@map("trusted_contacts")
+}
+
+/// A user's own label for a subset of their trusted contacts ("Family",
+/// "Work"). PRIVATE TO THE OWNER and nothing like the family-plan `Group`
+/// above: no other account can see it, join it, or be notified because of it.
+/// It is a folder over rows the owner already has, so it grants no new reach —
+/// live location still flows only through TrustedContact under the mutual
+/// consent rule (UsersService.filterConsentingContactUserIds).
+model ContactGroup {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  name      String
+  favorite  Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user    User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  members ContactGroupMember[]
+
+  // One name per owner, enforced by the database — two groups both called
+  // "Family" would be indistinguishable in the picker.
+  @@unique([userId, name])
+  @@index([userId])
+  @@map("contact_groups")
+}
+
+/// Join row: contact X is in group Y. The composite primary key makes a double
+/// insert impossible, and BOTH sides cascade — deleting a group drops only
+/// these rows (never the contacts), and deleting a contact quietly removes it
+/// from every group it was filed under.
+model ContactGroupMember {
+  groupId   String @map("group_id") @db.Uuid
+  contactId String @map("contact_id") @db.Uuid
+
+  group   ContactGroup   @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  contact TrustedContact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@id([groupId, contactId])
+  @@map("contact_group_members")
 }
 
 model DeviceToken {
@@ -306,6 +373,13 @@ model Trip {
 
   @@index([userId, status])
   @@index([status])
+  // GiST on a PostGIS `geography` column. Declared here — with `map:` pinning
+  // the ORIGINAL hand-written name — so the datamodel matches the database.
+  // Before this, Prisma could not see the index and every `migrate diff`
+  // proposed DROPping it, which would have turned every corridor/radius/bbox
+  // query into a sequential scan the first time someone applied the diff.
+  @@index([origin], type: Gist, map: "trips_origin_gix")
+  @@index([destination], type: Gist, map: "trips_destination_gix")
   @@map("trips")
 }
 
@@ -323,6 +397,12 @@ model TripPoint {
   trip Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
 
   @@index([tripId, recordedAt])
+  // GiST on a PostGIS `geography` column. Declared here — with `map:` pinning
+  // the ORIGINAL hand-written name — so the datamodel matches the database.
+  // Before this, Prisma could not see the index and every `migrate diff`
+  // proposed DROPping it, which would have turned every corridor/radius/bbox
+  // query into a sequential scan the first time someone applied the diff.
+  @@index([geog], type: Gist, map: "trip_points_geog_gix")
   @@map("trip_points")
 }
 
@@ -334,6 +414,12 @@ model TripRoute {
 
   trip Trip @relation(fields: [tripId], references: [id], onDelete: Cascade)
 
+  // GiST on a PostGIS `geography` column. Declared here — with `map:` pinning
+  // the ORIGINAL hand-written name — so the datamodel matches the database.
+  // Before this, Prisma could not see the index and every `migrate diff`
+  // proposed DROPping it, which would have turned every corridor/radius/bbox
+  // query into a sequential scan the first time someone applied the diff.
+  @@index([path], type: Gist, map: "trip_routes_path_gix")
   @@map("trip_routes")
 }
 
@@ -378,6 +464,12 @@ model Report {
 
   @@index([status, expiresAt])
   @@index([reporterId])
+  // GiST on a PostGIS `geography` column. Declared here — with `map:` pinning
+  // the ORIGINAL hand-written name — so the datamodel matches the database.
+  // Before this, Prisma could not see the index and every `migrate diff`
+  // proposed DROPping it, which would have turned every corridor/radius/bbox
+  // query into a sequential scan the first time someone applied the diff.
+  @@index([geog], type: Gist, map: "reports_geog_gix")
   @@map("reports")
 }
 
@@ -541,7 +633,11 @@ model SosEscalation {
   /// Whether plan enforcement was on at raise time.
   enforced       Boolean             @default(false)
   /// Frozen ladder: consenting contact userIds, in the order they are paged.
-  contactOrder   String[]            @map("contact_order")
+  /// `@default([])` is load-bearing: the column really does carry
+  /// `DEFAULT ARRAY[]::TEXT[]` (written by hand in 20260725140000), and without
+  /// it here every `migrate diff` proposes dropping that default. See the
+  /// "hand-written objects" note at the top of this file.
+  contactOrder   String[]            @default([]) @map("contact_order")
   /// Current ladder position (index into `contactOrder`).
   rank           Int                 @default(0)
   /// Attempts already made at `rank` (drives the retry backoff).
@@ -580,7 +676,9 @@ model Plan {
   /// Billing cadence of the price above — 'month' for every plan we sell today.
   interval         String   @default("month")
   /// Marketing bullet list, rendered verbatim by the app and the website.
-  features         String[]
+  /// `@default([])` matches the hand-written `DEFAULT ARRAY[]::TEXT[]` from
+  /// 20260725090000; omitting it makes every `migrate diff` propose dropping it.
+  features         String[] @default([])
   isActive         Boolean  @default(true) @map("is_active")
   sortOrder        Int      @default(0) @map("sort_order")
   createdAt        DateTime @default(now()) @map("created_at")

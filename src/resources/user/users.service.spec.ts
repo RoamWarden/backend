@@ -12,8 +12,13 @@ import { UsersService } from './users.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RedisService } from '../../providers/redis/redis.service';
 import type { CreateContactDto } from './dto/create-contact.dto';
+import type { CreateContactGroupDto } from './dto/create-contact-group.dto';
 import type { RegisterDeviceDto } from './dto/register-device.dto';
+import type { UpdateContactDto } from './dto/update-contact.dto';
+import type { UpdateContactGroupDto } from './dto/update-contact-group.dto';
 import {
+  CONTACT_GROUP_MEMBERS_INCLUDE,
+  CONTACT_GROUP_NOT_FOUND,
   CONTACT_LOOKUP_MAX_PER_WINDOW,
   CONTACT_LOOKUP_NO_ACCOUNT,
   CONTACT_LOOKUP_RATE_LIMITED,
@@ -22,13 +27,18 @@ import {
   CONTACT_LOOKUP_SELF_CODE,
   CONTACT_LOOKUP_WINDOW_S,
   CONTACT_NEEDS_REACHABLE_FIELD,
+  CONTACT_NOT_FOUND,
+  CONTACT_PAGE_DEFAULT_LIMIT,
+  CONTACT_PAGE_MAX_LIMIT,
   CONTACT_USER_SELECT,
   DUPLICATE_LINKED_CONTACT,
   GOOGLE_NO_ACCOUNT_CODE,
   LINKED_USER_NOT_FOUND,
+  contactIdsNotYours,
   contactLookupAlreadyAdded,
   contactLookupFound,
   contactLookupQuotaKey,
+  duplicateContactGroupName,
   googleEmailLinkedElsewhere,
   googleEmailNotVerified,
   googleNoAccount,
@@ -68,6 +78,18 @@ describe('UsersService', () => {
       create: jest.Mock;
       update: jest.Mock;
       deleteMany: jest.Mock;
+      count: jest.Mock;
+    };
+    contactGroup: {
+      findMany: jest.Mock;
+      findFirst: jest.Mock;
+      create: jest.Mock;
+      update: jest.Mock;
+      deleteMany: jest.Mock;
+    };
+    contactGroupMember: {
+      createMany: jest.Mock;
+      deleteMany: jest.Mock;
     };
     deviceToken: {
       upsert: jest.Mock;
@@ -94,14 +116,32 @@ describe('UsersService', () => {
         create: jest.fn(),
         update: jest.fn(),
         deleteMany: jest.fn(),
+        count: jest.fn().mockResolvedValue(0),
+      },
+      contactGroup: {
+        findMany: jest.fn(),
+        findFirst: jest.fn().mockResolvedValue(null),
+        create: jest.fn(),
+        update: jest.fn(),
+        deleteMany: jest.fn(),
+      },
+      contactGroupMember: {
+        createMany: jest.fn(),
+        deleteMany: jest.fn(),
       },
       deviceToken: {
         upsert: jest.fn(),
         deleteMany: jest.fn(),
       },
       $queryRaw: jest.fn().mockResolvedValue([{ reputation: 0 }]),
-      // Runs the callback against the same mock so tx-based code paths work.
-      $transaction: jest.fn((cb: (tx: unknown) => unknown) => cb(prismaMock)),
+      // Two call shapes, both real: the CALLBACK form runs against the same
+      // mock so tx-based code paths work, and the ARRAY form resolves what it
+      // was handed so batched reads (page + count) behave like the client's.
+      $transaction: jest.fn((arg: unknown) =>
+        typeof arg === 'function'
+          ? (arg as (tx: unknown) => unknown)(prismaMock)
+          : Promise.all(arg as Promise<unknown>[]),
+      ),
     };
     redisMock = {
       clearPresence: jest.fn().mockResolvedValue(undefined),
@@ -1074,6 +1114,618 @@ describe('UsersService', () => {
       await expect(service.createContact('u1', dto)).rejects.toBeInstanceOf(
         NotFoundException,
       );
+    });
+  });
+
+  // ── listContacts (BACKWARD-COMPATIBLE SHAPE — do not paginate) ────────────
+
+  describe('listContacts', () => {
+    it('returns a FLAT ARRAY of every contact, unpaginated', async () => {
+      // TestFlight builds already in users' hands index straight into this
+      // array. If this test ever needs changing, the app is already broken.
+      const rows = [
+        { id: 'c1', name: 'Mum', favorite: true },
+        { id: 'c2', name: 'Ada', favorite: false },
+      ];
+      prismaMock.trustedContact.findMany.mockResolvedValue(rows);
+
+      const result = await service.listContacts('u1');
+
+      expect(Array.isArray(result)).toBe(true);
+      expect(result).toBe(rows);
+      const arg = firstArg<Prisma.TrustedContactFindManyArgs>(
+        prismaMock.trustedContact.findMany,
+      );
+      expect(arg.skip).toBeUndefined();
+      expect(arg.take).toBeUndefined();
+      expect(arg.where).toEqual({ userId: 'u1' });
+    });
+
+    it('carries the additive `favorite` field on each item', async () => {
+      prismaMock.trustedContact.findMany.mockResolvedValue([
+        { id: 'c1', name: 'Mum', favorite: true },
+      ]);
+      const result = await service.listContacts('u1');
+      expect(result[0]).toHaveProperty('favorite', true);
+    });
+  });
+
+  // ── listContactsPage (paged + searchable) ────────────────────────────────
+
+  describe('listContactsPage', () => {
+    const page1 = [{ id: 'c1', name: 'Mum', favorite: true }];
+
+    beforeEach(() => {
+      prismaMock.trustedContact.findMany.mockResolvedValue(page1);
+      prismaMock.trustedContact.count.mockResolvedValue(42);
+    });
+
+    it('returns the { data, page, limit, total } envelope', async () => {
+      await expect(service.listContactsPage('u1', {})).resolves.toEqual({
+        data: page1,
+        page: 1,
+        limit: CONTACT_PAGE_DEFAULT_LIMIT,
+        total: 42,
+      });
+    });
+
+    it('defaults to page 1 with a page size of 10', async () => {
+      await service.listContactsPage('u1', {});
+      const arg = firstArg<Prisma.TrustedContactFindManyArgs>(
+        prismaMock.trustedContact.findMany,
+      );
+      expect(arg.skip).toBe(0);
+      expect(arg.take).toBe(CONTACT_PAGE_DEFAULT_LIMIT);
+    });
+
+    it('skips (page - 1) * limit rows', async () => {
+      await service.listContactsPage('u1', { page: 3, limit: 10 });
+      const arg = firstArg<Prisma.TrustedContactFindManyArgs>(
+        prismaMock.trustedContact.findMany,
+      );
+      expect(arg.skip).toBe(20);
+      expect(arg.take).toBe(10);
+    });
+
+    it('caps limit at 50 and reports the CAPPED value back', async () => {
+      // Reporting the cap matters: a client that asked for 500 and got 50 rows
+      // must not conclude it has reached the end of the list.
+      const result = await service.listContactsPage('u1', { limit: 500 });
+      expect(result.limit).toBe(CONTACT_PAGE_MAX_LIMIT);
+      const arg = firstArg<Prisma.TrustedContactFindManyArgs>(
+        prismaMock.trustedContact.findMany,
+      );
+      expect(arg.take).toBe(CONTACT_PAGE_MAX_LIMIT);
+    });
+
+    it('orders favourites first, then name A-Z, then id', async () => {
+      // Postgres does the sorting; what this asserts is the instruction we give
+      // it. The trailing `id` is the stable tiebreak that stops `skip`/`take`
+      // dropping or repeating a row when two contacts share a name.
+      await service.listContactsPage('u1', {});
+      const arg = firstArg<Prisma.TrustedContactFindManyArgs>(
+        prismaMock.trustedContact.findMany,
+      );
+      expect(arg.orderBy).toEqual([
+        { favorite: 'desc' },
+        { name: 'asc' },
+        { id: 'asc' },
+      ]);
+    });
+
+    it('matches q against name, email AND phone, case-insensitively', async () => {
+      await service.listContactsPage('u1', { q: 'MuM' });
+      const arg = firstArg<Prisma.TrustedContactFindManyArgs>(
+        prismaMock.trustedContact.findMany,
+      );
+      expect(arg.where).toEqual({
+        userId: 'u1',
+        OR: [
+          { name: { contains: 'MuM', mode: 'insensitive' } },
+          { email: { contains: 'MuM', mode: 'insensitive' } },
+          { phone: { contains: 'MuM', mode: 'insensitive' } },
+        ],
+      });
+    });
+
+    it('finds a contact by a fragment of their phone number', async () => {
+      await service.listContactsPage('u1', { q: '4567' });
+      const arg = firstArg<Prisma.TrustedContactFindManyArgs>(
+        prismaMock.trustedContact.findMany,
+      );
+      const or = arg.where?.OR as Prisma.TrustedContactWhereInput[];
+      expect(or).toContainEqual({
+        phone: { contains: '4567', mode: 'insensitive' },
+      });
+    });
+
+    it('applies no search filter when q is absent or blank', async () => {
+      await service.listContactsPage('u1', { q: '   ' });
+      const arg = firstArg<Prisma.TrustedContactFindManyArgs>(
+        prismaMock.trustedContact.findMany,
+      );
+      expect(arg.where).toEqual({ userId: 'u1' });
+    });
+
+    it('is scoped to the caller and counts the SAME filtered set', async () => {
+      await service.listContactsPage('u1', { q: 'ada' });
+      const findArg = firstArg<Prisma.TrustedContactFindManyArgs>(
+        prismaMock.trustedContact.findMany,
+      );
+      const countArg = firstArg<Prisma.TrustedContactCountArgs>(
+        prismaMock.trustedContact.count,
+      );
+      expect(findArg.where).toHaveProperty('userId', 'u1');
+      // A mismatched count is how "12 of 40" starts lying to people.
+      expect(countArg.where).toEqual(findArg.where);
+      // One transaction, so a row added mid-request cannot split them.
+      expect(prismaMock.$transaction).toHaveBeenCalled();
+    });
+  });
+
+  // ── updateContact — favourite toggling ───────────────────────────────────
+
+  describe('updateContact (favorite)', () => {
+    const existing = {
+      id: 'c1',
+      userId: 'u1',
+      name: 'Mum',
+      phone: '+15551234567',
+      email: null,
+      contactUserId: null,
+      relation: null,
+      favorite: false,
+    };
+
+    it('sets favorite without touching any other field', async () => {
+      prismaMock.trustedContact.findFirst.mockResolvedValue(existing);
+      prismaMock.trustedContact.update.mockResolvedValue({
+        ...existing,
+        favorite: true,
+      });
+
+      const dto: UpdateContactDto = { favorite: true };
+      const result = await service.updateContact('u1', 'c1', dto);
+
+      expect(result).toHaveProperty('favorite', true);
+      const arg = firstArg<Prisma.TrustedContactUpdateArgs>(
+        prismaMock.trustedContact.update,
+      );
+      expect(arg.data).toEqual({ favorite: true });
+    });
+
+    it('un-favourites with an explicit false (not by omission)', async () => {
+      prismaMock.trustedContact.findFirst.mockResolvedValue({
+        ...existing,
+        favorite: true,
+      });
+      prismaMock.trustedContact.update.mockResolvedValue(existing);
+
+      await service.updateContact('u1', 'c1', { favorite: false });
+
+      const arg = firstArg<Prisma.TrustedContactUpdateArgs>(
+        prismaMock.trustedContact.update,
+      );
+      expect(arg.data).toEqual({ favorite: false });
+    });
+
+    it('leaves favorite alone when the field is omitted', async () => {
+      prismaMock.trustedContact.findFirst.mockResolvedValue(existing);
+      prismaMock.trustedContact.update.mockResolvedValue(existing);
+
+      await service.updateContact('u1', 'c1', { name: 'Mummy' });
+
+      const arg = firstArg<Prisma.TrustedContactUpdateArgs>(
+        prismaMock.trustedContact.update,
+      );
+      expect(arg.data).toEqual({ name: 'Mummy' });
+      expect(arg.data).not.toHaveProperty('favorite');
+    });
+
+    it("404s on another account's contact instead of favouriting it", async () => {
+      // Scoped read: `{ id, userId }` matches nothing, so this is a 404 with
+      // the ordinary message — never a 403 that would confirm the id exists.
+      prismaMock.trustedContact.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.updateContact('u1', 'someone-elses', { favorite: true }),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      await expect(
+        service.updateContact('u1', 'someone-elses', { favorite: true }),
+      ).rejects.toThrow(CONTACT_NOT_FOUND);
+      expect(prismaMock.trustedContact.update).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── contact groups ───────────────────────────────────────────────────────
+
+  const GROUP_CREATED_AT = new Date('2026-07-26T09:00:00Z');
+
+  /** A ContactGroup row as prisma returns it with CONTACT_GROUP_MEMBERS_INCLUDE. */
+  const groupRow = (
+    overrides: Partial<{
+      id: string;
+      name: string;
+      favorite: boolean;
+      contactIds: string[];
+    }> = {},
+  ) => ({
+    id: overrides.id ?? 'g1',
+    userId: 'u1',
+    name: overrides.name ?? 'Family',
+    favorite: overrides.favorite ?? false,
+    createdAt: GROUP_CREATED_AT,
+    members: (overrides.contactIds ?? []).map((contactId) => ({ contactId })),
+  });
+
+  describe('listContactGroups', () => {
+    it('maps rows to { id, name, favorite, memberCount, contactIds, createdAt }', async () => {
+      prismaMock.contactGroup.findMany.mockResolvedValue([
+        groupRow({ contactIds: ['c1', 'c2'] }),
+      ]);
+
+      await expect(service.listContactGroups('u1', {})).resolves.toEqual([
+        {
+          id: 'g1',
+          name: 'Family',
+          favorite: false,
+          memberCount: 2,
+          contactIds: ['c1', 'c2'],
+          createdAt: GROUP_CREATED_AT,
+        },
+      ]);
+      const arg = firstArg<Prisma.ContactGroupFindManyArgs>(
+        prismaMock.contactGroup.findMany,
+      );
+      expect(arg.where).toEqual({ userId: 'u1' });
+      expect(arg.include).toBe(CONTACT_GROUP_MEMBERS_INCLUDE);
+    });
+
+    it('filters on the group name, case-insensitively, still scoped to the caller', async () => {
+      prismaMock.contactGroup.findMany.mockResolvedValue([]);
+
+      await service.listContactGroups('u1', { q: 'FAM' });
+
+      const arg = firstArg<Prisma.ContactGroupFindManyArgs>(
+        prismaMock.contactGroup.findMany,
+      );
+      expect(arg.where).toEqual({
+        userId: 'u1',
+        name: { contains: 'FAM', mode: 'insensitive' },
+      });
+    });
+
+    it('orders favourites first, then name, then id', async () => {
+      prismaMock.contactGroup.findMany.mockResolvedValue([]);
+      await service.listContactGroups('u1', {});
+      const arg = firstArg<Prisma.ContactGroupFindManyArgs>(
+        prismaMock.contactGroup.findMany,
+      );
+      expect(arg.orderBy).toEqual([
+        { favorite: 'desc' },
+        { name: 'asc' },
+        { id: 'asc' },
+      ]);
+    });
+  });
+
+  describe('createContactGroup', () => {
+    it('creates the group and its membership in one write', async () => {
+      prismaMock.trustedContact.findMany.mockResolvedValue([
+        { id: 'c1' },
+        { id: 'c2' },
+      ]);
+      prismaMock.contactGroup.create.mockResolvedValue(
+        groupRow({ contactIds: ['c1', 'c2'] }),
+      );
+
+      const dto: CreateContactGroupDto = {
+        name: 'Family',
+        contactIds: ['c1', 'c2'],
+      };
+      await expect(service.createContactGroup('u1', dto)).resolves.toEqual({
+        id: 'g1',
+        name: 'Family',
+        favorite: false,
+        memberCount: 2,
+        contactIds: ['c1', 'c2'],
+        createdAt: GROUP_CREATED_AT,
+      });
+
+      const arg = firstArg<Prisma.ContactGroupCreateArgs>(
+        prismaMock.contactGroup.create,
+      );
+      expect(arg.data).toEqual({
+        userId: 'u1',
+        name: 'Family',
+        favorite: false,
+        members: { create: [{ contactId: 'c1' }, { contactId: 'c2' }] },
+      });
+    });
+
+    it('trims the name and dedups repeated contact ids', async () => {
+      prismaMock.trustedContact.findMany.mockResolvedValue([{ id: 'c1' }]);
+      prismaMock.contactGroup.create.mockResolvedValue(
+        groupRow({ contactIds: ['c1'] }),
+      );
+
+      await service.createContactGroup('u1', {
+        name: '  Family  ',
+        contactIds: ['c1', 'c1'],
+      });
+
+      const arg = firstArg<Prisma.ContactGroupCreateArgs>(
+        prismaMock.contactGroup.create,
+      );
+      expect(arg.data.name).toBe('Family');
+      expect(arg.data).toHaveProperty('members', {
+        create: [{ contactId: 'c1' }],
+      });
+    });
+
+    it('creates an empty group when no contactIds are given (no lookup)', async () => {
+      prismaMock.contactGroup.create.mockResolvedValue(groupRow());
+
+      const result = await service.createContactGroup('u1', { name: 'Work' });
+
+      expect(result.memberCount).toBe(0);
+      expect(result.contactIds).toEqual([]);
+      expect(prismaMock.trustedContact.findMany).not.toHaveBeenCalled();
+      const arg = firstArg<Prisma.ContactGroupCreateArgs>(
+        prismaMock.contactGroup.create,
+      );
+      expect(arg.data).not.toHaveProperty('members');
+    });
+
+    it('honours favorite: true on create', async () => {
+      prismaMock.contactGroup.create.mockResolvedValue(
+        groupRow({ favorite: true }),
+      );
+      const result = await service.createContactGroup('u1', {
+        name: 'Family',
+        favorite: true,
+      });
+      expect(result.favorite).toBe(true);
+      const arg = firstArg<Prisma.ContactGroupCreateArgs>(
+        prismaMock.contactGroup.create,
+      );
+      expect(arg.data.favorite).toBe(true);
+    });
+
+    it('rejects contact ids that are not the caller’s, naming them, and creates nothing', async () => {
+      // Same failure a stale list picker produces for trip watchers, and the
+      // same message shape — a contact on another account looks exactly like a
+      // deleted one, so this never confirms the id exists.
+      prismaMock.trustedContact.findMany.mockResolvedValue([{ id: 'c1' }]);
+
+      const dto: CreateContactGroupDto = {
+        name: 'Family',
+        contactIds: ['c1', 'someone-elses'],
+      };
+      await expect(
+        service.createContactGroup('u1', dto),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      await expect(service.createContactGroup('u1', dto)).rejects.toThrow(
+        contactIdsNotYours(['someone-elses']),
+      );
+      expect(prismaMock.contactGroup.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects a duplicate name with 409, quoting the group that already exists', async () => {
+      // Stored as "Family"; the caller typed "family". The message quotes the
+      // stored casing so they can see what it clashed with.
+      prismaMock.contactGroup.findFirst.mockResolvedValue({ name: 'Family' });
+
+      const dto: CreateContactGroupDto = { name: 'family' };
+      await expect(
+        service.createContactGroup('u1', dto),
+      ).rejects.toBeInstanceOf(ConflictException);
+      await expect(service.createContactGroup('u1', dto)).rejects.toThrow(
+        duplicateContactGroupName('Family'),
+      );
+      expect(prismaMock.contactGroup.create).not.toHaveBeenCalled();
+      // Case-insensitive by design — two "Family" groups in a picker is a bug.
+      const arg = firstArg<Prisma.ContactGroupFindFirstArgs>(
+        prismaMock.contactGroup.findFirst,
+      );
+      expect(arg.where).toEqual({
+        userId: 'u1',
+        name: { equals: 'family', mode: 'insensitive' },
+      });
+    });
+
+    it('maps a P2002 create race (concurrent same name) to 409', async () => {
+      prismaMock.contactGroup.create.mockRejectedValue(prismaError('P2002'));
+      await expect(
+        service.createContactGroup('u1', { name: 'Family' }),
+      ).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    it('maps a P2003 create race (contact deleted mid-flow) to a 400', async () => {
+      prismaMock.trustedContact.findMany.mockResolvedValue([{ id: 'c1' }]);
+      prismaMock.contactGroup.create.mockRejectedValue(prismaError('P2003'));
+      await expect(
+        service.createContactGroup('u1', {
+          name: 'Family',
+          contactIds: ['c1'],
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    });
+  });
+
+  describe('updateContactGroup', () => {
+    it("404s on another account's group and writes nothing", async () => {
+      // The ownership read is `{ id, userId }`, so someone else's real id and a
+      // deleted id are indistinguishable from here — deliberately not a 403.
+      prismaMock.contactGroup.findFirst.mockResolvedValue(null);
+
+      const dto: UpdateContactGroupDto = { name: 'Mine now' };
+      await expect(
+        service.updateContactGroup('u1', 'someone-elses', dto),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      await expect(
+        service.updateContactGroup('u1', 'someone-elses', dto),
+      ).rejects.toThrow(CONTACT_GROUP_NOT_FOUND);
+      expect(prismaMock.$transaction).not.toHaveBeenCalled();
+      expect(prismaMock.contactGroup.update).not.toHaveBeenCalled();
+      expect(prismaMock.contactGroupMember.deleteMany).not.toHaveBeenCalled();
+    });
+
+    it('REPLACES the whole membership when contactIds is present', async () => {
+      prismaMock.contactGroup.findFirst.mockResolvedValueOnce({
+        id: 'g1',
+        name: 'Family',
+      });
+      prismaMock.trustedContact.findMany.mockResolvedValue([{ id: 'c9' }]);
+      prismaMock.contactGroup.update.mockResolvedValue(
+        groupRow({ contactIds: ['c9'] }),
+      );
+
+      const result = await service.updateContactGroup('u1', 'g1', {
+        contactIds: ['c9'],
+      });
+
+      expect(prismaMock.contactGroupMember.deleteMany).toHaveBeenCalledWith({
+        where: { groupId: 'g1' },
+      });
+      expect(prismaMock.contactGroupMember.createMany).toHaveBeenCalledWith({
+        data: [{ groupId: 'g1', contactId: 'c9' }],
+      });
+      expect(result.contactIds).toEqual(['c9']);
+    });
+
+    it('empties the group when contactIds is [] (present, not absent)', async () => {
+      prismaMock.contactGroup.findFirst.mockResolvedValueOnce({
+        id: 'g1',
+        name: 'Family',
+      });
+      prismaMock.contactGroup.update.mockResolvedValue(groupRow());
+
+      const result = await service.updateContactGroup('u1', 'g1', {
+        contactIds: [],
+      });
+
+      expect(prismaMock.contactGroupMember.deleteMany).toHaveBeenCalledWith({
+        where: { groupId: 'g1' },
+      });
+      // Nothing to insert — and critically, no fallback to "leave it alone".
+      expect(prismaMock.contactGroupMember.createMany).not.toHaveBeenCalled();
+      expect(result.memberCount).toBe(0);
+    });
+
+    it('PRESERVES the membership when contactIds is absent', async () => {
+      // A rename must never truncate a roster the app did not send.
+      prismaMock.contactGroup.findFirst
+        .mockResolvedValueOnce({ id: 'g1', name: 'Family' })
+        .mockResolvedValueOnce(null);
+      prismaMock.contactGroup.update.mockResolvedValue(
+        groupRow({ name: 'Close family', contactIds: ['c1', 'c2'] }),
+      );
+
+      const result = await service.updateContactGroup('u1', 'g1', {
+        name: 'Close family',
+      });
+
+      expect(prismaMock.contactGroupMember.deleteMany).not.toHaveBeenCalled();
+      expect(prismaMock.contactGroupMember.createMany).not.toHaveBeenCalled();
+      expect(result.contactIds).toEqual(['c1', 'c2']);
+      const arg = firstArg<Prisma.ContactGroupUpdateArgs>(
+        prismaMock.contactGroup.update,
+      );
+      expect(arg.data).toEqual({ name: 'Close family' });
+    });
+
+    it('rejects contact ids that are not the caller’s and writes nothing', async () => {
+      prismaMock.contactGroup.findFirst.mockResolvedValueOnce({
+        id: 'g1',
+        name: 'Family',
+      });
+      prismaMock.trustedContact.findMany.mockResolvedValue([]);
+
+      await expect(
+        service.updateContactGroup('u1', 'g1', {
+          contactIds: ['someone-elses'],
+        }),
+      ).rejects.toThrow(contactIdsNotYours(['someone-elses']));
+      expect(prismaMock.contactGroupMember.deleteMany).not.toHaveBeenCalled();
+      expect(prismaMock.contactGroup.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects a rename onto an existing group name with 409', async () => {
+      prismaMock.contactGroup.findFirst
+        .mockResolvedValueOnce({ id: 'g1', name: 'Work' })
+        .mockResolvedValueOnce({ name: 'Family' });
+
+      await expect(
+        service.updateContactGroup('u1', 'g1', { name: 'Family' }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(prismaMock.contactGroup.update).not.toHaveBeenCalled();
+    });
+
+    it('lets a group keep its own name (no self-clash)', async () => {
+      prismaMock.contactGroup.findFirst.mockResolvedValueOnce({
+        id: 'g1',
+        name: 'Family',
+      });
+      prismaMock.contactGroup.update.mockResolvedValue(
+        groupRow({ favorite: true }),
+      );
+
+      await expect(
+        service.updateContactGroup('u1', 'g1', {
+          name: 'Family',
+          favorite: true,
+        }),
+      ).resolves.toHaveProperty('favorite', true);
+      // Only the ownership read ran — the clash check is skipped when the name
+      // is unchanged, so a favourite toggle can never 409 on itself.
+      expect(prismaMock.contactGroup.findFirst).toHaveBeenCalledTimes(1);
+    });
+
+    it('maps a P2025 race (group deleted mid-update) to the 404 message', async () => {
+      prismaMock.contactGroup.findFirst.mockResolvedValueOnce({
+        id: 'g1',
+        name: 'Family',
+      });
+      prismaMock.contactGroup.update.mockRejectedValue(prismaError('P2025'));
+
+      await expect(
+        service.updateContactGroup('u1', 'g1', { favorite: true }),
+      ).rejects.toThrow(CONTACT_GROUP_NOT_FOUND);
+    });
+  });
+
+  describe('deleteContactGroup', () => {
+    it('deletes the group and NEVER the contacts in it', async () => {
+      prismaMock.contactGroup.deleteMany.mockResolvedValue({ count: 1 });
+
+      await expect(
+        service.deleteContactGroup('u1', 'g1'),
+      ).resolves.toBeUndefined();
+
+      expect(prismaMock.contactGroup.deleteMany).toHaveBeenCalledWith({
+        where: { id: 'g1', userId: 'u1' },
+      });
+      // The cascade stops at contact_group_members. Losing a trusted contact to
+      // a tidy-up would be a safety bug, not a tidy-up.
+      expect(prismaMock.trustedContact.deleteMany).not.toHaveBeenCalled();
+      expect(prismaMock.trustedContact.update).not.toHaveBeenCalled();
+    });
+
+    it("404s on another account's group, having deleted nothing", async () => {
+      prismaMock.contactGroup.deleteMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.deleteContactGroup('u1', 'someone-elses'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      await expect(
+        service.deleteContactGroup('u1', 'someone-elses'),
+      ).rejects.toThrow(CONTACT_GROUP_NOT_FOUND);
+      // Scoped in the same statement as the delete: the owner's row was never
+      // at risk, and the caller learns nothing about whether the id exists.
+      expect(prismaMock.contactGroup.deleteMany).toHaveBeenCalledWith({
+        where: { id: 'someone-elses', userId: 'u1' },
+      });
     });
   });
 

@@ -1,5 +1,8 @@
 import type { Prisma, User } from '@prisma/client';
-import type { CONTACT_USER_SELECT } from '../constant/users.constants';
+import type {
+  CONTACT_GROUP_MEMBERS_INCLUDE,
+  CONTACT_USER_SELECT,
+} from '../constant/users.constants';
 
 /**
  * Verified Google identity handed to {@link UsersService.upsertFromGoogle}.
@@ -36,6 +39,42 @@ export interface GoogleUpsertOptions {
 export type ContactWithLinkedUser = Prisma.TrustedContactGetPayload<{
   include: typeof CONTACT_USER_SELECT;
 }>;
+
+/**
+ * One page of the caller's own contacts.
+ *
+ * `data` carries exactly the same objects as the unpaginated
+ * `GET /me/contacts`, so a client can move between the two routes without a
+ * second mapper.
+ */
+export interface PaginatedContacts {
+  data: ContactWithLinkedUser[];
+  page: number;
+  limit: number;
+  /** Rows matching the search, NOT the size of this page. */
+  total: number;
+}
+
+/** A contact group row with just its membership ids attached. */
+export type ContactGroupWithMembers = Prisma.ContactGroupGetPayload<{
+  include: typeof CONTACT_GROUP_MEMBERS_INCLUDE;
+}>;
+
+/**
+ * A contact group as the API returns it.
+ *
+ * `memberCount` is redundant with `contactIds.length` on purpose: a list screen
+ * shows "4 people" without caring which four, and shipping the number means it
+ * never has to reach into an array to render a label.
+ */
+export interface ContactGroupView {
+  id: string;
+  name: string;
+  favorite: boolean;
+  memberCount: number;
+  contactIds: string[];
+  createdAt: Date;
+}
 
 /** Public profile shape — never exposes googleSub or passwordHash. */
 export type UserProfile = Pick<

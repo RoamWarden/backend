@@ -109,6 +109,10 @@ export class SosService {
     const coords = await this.resolveCoordinates(user.id, dto, trip);
     const wasActive = trip?.status === TripStatus.ACTIVE;
 
+    // Whether THIS call actually flipped the trip to SOS. `wasActive` is only
+    // what we READ a moment ago; the write below decides.
+    let raisedOnTrip = false;
+
     const event = await this.prisma.$transaction(async (tx) => {
       const created = await tx.sosEvent.create({
         data: {
@@ -120,10 +124,17 @@ export class SosService {
         },
       });
       if (trip && wasActive) {
-        await tx.trip.update({
-          where: { id: trip.id },
+        // Conditional, not a bare update: the monitor's auto-close (or a stop
+        // from another device) can end the trip between the read above and this
+        // write, and an unconditional update would resurrect an ended row into
+        // SOS — endedAt set, status live, watchers shown a journey that is over.
+        // Losing this race costs nothing that matters: the SosEvent is committed
+        // either way, so the alarm still reaches the contacts below.
+        const { count } = await tx.trip.updateMany({
+          where: { id: trip.id, status: TripStatus.ACTIVE },
           data: { status: TripStatus.SOS },
         });
+        raisedOnTrip = count > 0;
       }
       return created;
     });
@@ -132,7 +143,7 @@ export class SosService {
       `SOS ${event.id} raised by user ${user.id}${trip ? ` on trip ${trip.id}` : ' (no trip)'}`,
     );
 
-    if (trip && wasActive) {
+    if (trip && raisedOnTrip) {
       await this.safePublish(channelTripLive(trip.id), {
         kind: 'status',
         tripId: trip.id,
