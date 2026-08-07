@@ -261,7 +261,8 @@ export class AiService {
     }
 
     const prompt = [
-      'Classify the reported travel incident from the context below. Return valid JSON.',
+      'Classify the reported travel incident. Respond with ONLY this JSON shape:',
+      '{"type":"POTHOLE|POLICE|ACCIDENT|CONSTRUCTION|HAZARD|TRAFFIC|WEATHER","severity":"LOW|MEDIUM|HIGH","confidence":0.9,"summary":"brief text"}',
       context.voiceText ? `Voice note: ${context.voiceText}` : null,
       context.imageLabels?.length
         ? `Image labels: ${context.imageLabels.join(', ')}`
@@ -396,8 +397,9 @@ export class AiService {
             .join('\n')
         : 'No incidents reported along the route.';
 
-    const prompt = `You are a travel safety analyst for the travel app Roam Warden.
-Given the context below, produce a trip recap with a safety score, a short summary, and safety tips. Return valid JSON.
+    const prompt = `You are a travel safety analyst for Roam Warden.
+Respond with ONLY this JSON shape:
+{"safetyScore":7,"summary":"2-4 sentence recap","tips":["tip 1","tip 2","tip 3"]}
 
 Trip details:
 - Mode: ${context.mode}
@@ -483,7 +485,8 @@ ${incidentList}`;
       `Route from ${originName} to ${destName}.`,
       `Mode: ${context.mode}, distance: ${context.distanceKm.toFixed(1)}km, estimated ${context.estimatedDurationMin}min.`,
       `Incidents: ${incidentList}`,
-      'Provide a risk level, actionable driving advisories, and a brief summary. Return valid JSON.',
+      `Respond with ONLY this JSON shape (use EXACTLY these field names — riskLevel, incidentCount, advisories, summary):`,
+      `{"riskLevel":"LOW|MEDIUM|HIGH","incidentCount":0,"advisories":["tip1","tip2"],"summary":"brief recap"}`,
     ].join('\n');
 
     const response = await fetch(
