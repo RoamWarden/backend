@@ -13,67 +13,6 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
-// ── JSON Schema definitions for structured output ─────────────────────────
-// Groq supports OpenAI-compatible json_schema response_format.
-// Using strict:true guarantees valid JSON matching the schema — no manual
-// validation or try/catch needed at call sites.
-
-const INCIDENT_SCHEMA = {
-  type: 'object' as const,
-  properties: {
-    type: {
-      type: 'string' as const,
-      enum: [
-        'POTHOLE',
-        'POLICE',
-        'ACCIDENT',
-        'CONSTRUCTION',
-        'HAZARD',
-        'TRAFFIC',
-        'WEATHER',
-      ],
-    },
-    severity: { type: 'string' as const, enum: ['LOW', 'MEDIUM', 'HIGH'] },
-    confidence: { type: 'number' as const },
-    summary: { type: 'string' as const },
-  },
-  required: ['type', 'severity', 'confidence', 'summary'],
-  additionalProperties: false,
-};
-
-const TRIP_RECAP_SCHEMA = {
-  type: 'object' as const,
-  properties: {
-    safetyScore: { type: 'integer' as const, minimum: 1, maximum: 10 },
-    summary: { type: 'string' as const },
-    tips: {
-      type: 'array' as const,
-      items: { type: 'string' as const },
-      minItems: 1,
-      maxItems: 5,
-    },
-  },
-  required: ['safetyScore', 'summary', 'tips'],
-  additionalProperties: false,
-};
-
-const ROUTE_CHECK_SCHEMA = {
-  type: 'object' as const,
-  properties: {
-    riskLevel: { type: 'string' as const, enum: ['LOW', 'MEDIUM', 'HIGH'] },
-    incidentCount: { type: 'integer' as const, minimum: 0 },
-    advisories: {
-      type: 'array' as const,
-      items: { type: 'string' as const },
-      minItems: 1,
-      maxItems: 5,
-    },
-    summary: { type: 'string' as const },
-  },
-  required: ['riskLevel', 'incidentCount', 'advisories', 'summary'],
-  additionalProperties: false,
-};
-
 // ── API response shapes ──────────────────────────────────────────────────
 
 interface GroqWhisperResponse {
@@ -341,17 +280,10 @@ export class AiService {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'gpt-4o-mini',
+          model: 'llama-3.3-70b-versatile',
           messages: [{ role: 'user', content: prompt }],
           temperature: 0,
-          response_format: {
-            type: 'json_schema',
-            json_schema: {
-              name: 'incident_classification',
-              strict: true,
-              schema: INCIDENT_SCHEMA,
-            },
-          },
+          response_format: { type: 'json_object' },
         }),
       },
     );
@@ -487,17 +419,10 @@ ${incidentList}`;
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'gpt-4o-mini',
+          model: 'llama-3.3-70b-versatile',
           messages: [{ role: 'user', content: prompt }],
           temperature: 0,
-          response_format: {
-            type: 'json_schema',
-            json_schema: {
-              name: 'trip_recap',
-              strict: true,
-              schema: TRIP_RECAP_SCHEMA,
-            },
-          },
+          response_format: { type: 'json_object' },
         }),
       },
     );
@@ -570,17 +495,10 @@ ${incidentList}`;
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'gpt-4o-mini',
+          model: 'llama-3.3-70b-versatile',
           messages: [{ role: 'user', content: prompt }],
           temperature: 0,
-          response_format: {
-            type: 'json_schema',
-            json_schema: {
-              name: 'route_check',
-              strict: true,
-              schema: ROUTE_CHECK_SCHEMA,
-            },
-          },
+          response_format: { type: 'json_object' },
         }),
       },
     );
