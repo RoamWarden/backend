@@ -261,7 +261,7 @@ export class AiService {
     }
 
     const prompt = [
-      'Classify the reported travel incident from the context below.',
+      'Classify the reported travel incident from the context below. Return valid JSON.',
       context.voiceText ? `Voice note: ${context.voiceText}` : null,
       context.imageLabels?.length
         ? `Image labels: ${context.imageLabels.join(', ')}`
@@ -397,7 +397,7 @@ export class AiService {
         : 'No incidents reported along the route.';
 
     const prompt = `You are a travel safety analyst for the travel app Roam Warden.
-Given the context below, produce a trip recap with a safety score, a short summary, and safety tips.
+Given the context below, produce a trip recap with a safety score, a short summary, and safety tips. Return valid JSON.
 
 Trip details:
 - Mode: ${context.mode}
@@ -483,7 +483,7 @@ ${incidentList}`;
       `Route from ${originName} to ${destName}.`,
       `Mode: ${context.mode}, distance: ${context.distanceKm.toFixed(1)}km, estimated ${context.estimatedDurationMin}min.`,
       `Incidents: ${incidentList}`,
-      'Provide a risk level, actionable driving advisories, and a brief summary.',
+      'Provide a risk level, actionable driving advisories, and a brief summary. Return valid JSON.',
     ].join('\n');
 
     const response = await fetch(
