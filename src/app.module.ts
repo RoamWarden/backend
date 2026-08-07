@@ -26,6 +26,7 @@ import { SosModule } from './resources/sos/sos.module';
 import { TripsModule } from './resources/trip/trips.module';
 import { UsersModule } from './resources/user/users.module';
 import { WaitlistModule } from './resources/waitlist/waitlist.module';
+import { AiModule } from './ai/ai.module';
 
 @Module({
   imports: [
@@ -71,6 +72,7 @@ import { WaitlistModule } from './resources/waitlist/waitlist.module';
     WaitlistModule,
     BillingModule,
     GroupsModule,
+    AiModule,
   ],
   controllers: [AppController],
   providers: [
